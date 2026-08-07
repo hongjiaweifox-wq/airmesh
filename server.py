@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""Family device quick console — local proxy + static UI.
+
+Usage (from repo root or this folder):
+  python3 groupAppControl/server.py
+  # http://127.0.0.1:5178  (本机)
+  # http://<局域网IP>:5178  (同网段可访问)
+"""
+
+import csv
+import json
+import os
+import re
+import socket
+import ssl
+import sys
+import threading
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+STORE_FILE = DATA_DIR / "store.json"
+ELECTION_DIR = DATA_DIR / "election"
+ELECTION_SETTINGS_FILE = DATA_DIR / "election_settings.json"
+ELECTION_LOCK = threading.Lock()
+ELECTION_CSV_FIELDS = [
+    "pollAt",
+    "reportTime",
+    "homeId",
+    "masterDeviceId",
+    "masterName",
+    "masterChanged",
+    "prevMasterDeviceId",
+    "conflict",
+    "masterDeviceIds",
+    "slaveDeviceIds",
+    "devicesJson",
+]
+ELECTION_DEFAULT_INTERVAL_SEC = 5
+# 0.0.0.0 = 允许局域网访问；可用 DEVICE_CONSOLE_HOST=127.0.0.1 仅本机
+DEFAULT_HOST = os.environ.get("DEVICE_CONSOLE_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.environ.get("DEVICE_CONSOLE_PORT", "5178"))
+
+# Hosts allowed for proxy (ops + hestia)
+ALLOWED_HOSTS = {
+    "newenergy-operation-cn.wgine-inc.com",
+    "newenergy-operation-cn.tuya-inc.com",
+    "newenergy-operation-eu.wgine-inc.com",
+    "newenergy-operation-eu.tuya-inc.com",
+    "newenergy-operation-us.wgine-inc.com",
+    "newenergy-operation-us.tuya-inc.com",
+    "newenergy-operation-sg.tuya-inc.com",
+    "newenergy-operation-weaz.tuya-inc.com",
+    "newenergy-operation-ueaz.tuya-inc.com",
+    "hestia-cn.tuya-inc.com",
+    "hestia-cn.wgine-inc.com",
+    "hestia-eu.tuya-inc.com",
+    "hestia-eu.wgine-inc.com",
+    "hestia-us.tuya-inc.com",
+    "hestia-us.wgine-inc.com",
+    "hestia-sg.tuya-inc.com",
+    "hestia-weaz.tuya-inc.com",
+    "hestia-ueaz.tuya-inc.com",
+    "127.0.0.1",
+    "localhost",
+}
+
+API_PORT = 7799
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+def _json_response(handler: SimpleHTTPRequestHandler, code: int, payload: Any) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _default_store() -> Dict[str, Any]:
+    return {"cookies": {}, "homes": [], "activeHomeId": None}
+
+
+def _load_store() -> Dict[str, Any]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not STORE_FILE.exists():
+        return _default_store()
+    try:
+        raw = json.loads(STORE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return _default_store()
+        return {
+            "cookies": raw.get("cookies") if isinstance(raw.get("cookies"), dict) else {},
+            "homes": raw.get("homes") if isinstance(raw.get("homes"), list) else [],
+            "activeHomeId": raw.get("activeHomeId"),
+        }
+    except Exception:
+        return _default_store()
+
+
+def _save_store(payload: Dict[str, Any]) -> Dict[str, Any]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    store = {
+        "cookies": payload.get("cookies") if isinstance(payload.get("cookies"), dict) else {},
+        "homes": payload.get("homes") if isinstance(payload.get("homes"), list) else [],
+        "activeHomeId": payload.get("activeHomeId"),
+    }
+    tmp = STORE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(STORE_FILE)
+    return store
+
+
+def _read_json(handler: SimpleHTTPRequestHandler) -> Dict[str, Any]:
+    length = int(handler.headers.get("Content-Length") or 0)
+    if length <= 0:
+        return {}
+    raw = handler.rfile.read(length)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _safe_home_key(home_id: str) -> str:
+    key = re.sub(r"[^A-Za-z0-9._-]+", "_", str(home_id or "").strip())
+    return key[:120] or "default"
+
+
+def _election_csv_path(home_id: str) -> Path:
+    ELECTION_DIR.mkdir(parents=True, exist_ok=True)
+    return ELECTION_DIR / f"{_safe_home_key(home_id)}.csv"
+
+
+def _load_election_settings() -> Dict[str, Any]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not ELECTION_SETTINGS_FILE.exists():
+        return {"intervalSec": ELECTION_DEFAULT_INTERVAL_SEC, "byHome": {}}
+    try:
+        raw = json.loads(ELECTION_SETTINGS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {"intervalSec": ELECTION_DEFAULT_INTERVAL_SEC, "byHome": {}}
+        interval = int(raw.get("intervalSec") or ELECTION_DEFAULT_INTERVAL_SEC)
+        by_home = raw.get("byHome") if isinstance(raw.get("byHome"), dict) else {}
+        return {"intervalSec": max(1, min(3600, interval)), "byHome": by_home}
+    except Exception:
+        return {"intervalSec": ELECTION_DEFAULT_INTERVAL_SEC, "byHome": {}}
+
+
+def _save_election_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cur = _load_election_settings()
+    if "intervalSec" in payload:
+        try:
+            cur["intervalSec"] = max(1, min(3600, int(payload.get("intervalSec"))))
+        except Exception:
+            pass
+    home_id = str(payload.get("homeId") or "").strip()
+    if home_id and "intervalSec" in payload:
+        by_home = cur.get("byHome") if isinstance(cur.get("byHome"), dict) else {}
+        by_home[home_id] = {"intervalSec": cur["intervalSec"]}
+        cur["byHome"] = by_home
+    tmp = ELECTION_SETTINGS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(ELECTION_SETTINGS_FILE)
+    return cur
+
+
+def _election_interval_for(home_id: str) -> int:
+    settings = _load_election_settings()
+    home_id = str(home_id or "").strip()
+    by_home = settings.get("byHome") if isinstance(settings.get("byHome"), dict) else {}
+    if home_id and isinstance(by_home.get(home_id), dict):
+        try:
+            return max(1, min(3600, int(by_home[home_id].get("intervalSec"))))
+        except Exception:
+            pass
+    return int(settings.get("intervalSec") or ELECTION_DEFAULT_INTERVAL_SEC)
+
+
+def _append_election_rows(home_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    path = _election_csv_path(home_id)
+    with ELECTION_LOCK:
+        header_ok = False
+        if path.exists() and path.stat().st_size > 0:
+            try:
+                with path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, [])
+                header_ok = list(header) == list(ELECTION_CSV_FIELDS)
+            except Exception:
+                header_ok = False
+            if not header_ok:
+                # schema changed — drop legacy file and start fresh
+                path.unlink(missing_ok=True)
+        new_file = not path.exists() or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=ELECTION_CSV_FIELDS, extrasaction="ignore")
+            if new_file:
+                writer.writeheader()
+            for row in rows:
+                out = {k: "" if row.get(k) is None else row.get(k) for k in ELECTION_CSV_FIELDS}
+                writer.writerow(out)
+        count = 0
+        with path.open("r", encoding="utf-8", newline="") as f:
+            count = max(0, sum(1 for _ in f) - 1)
+    return {"path": str(path), "rowCount": count}
+
+
+def _read_election_rows(home_id: str, limit: int = 800) -> Dict[str, Any]:
+    path = _election_csv_path(home_id)
+    limit = max(1, min(5000, int(limit or 800)))
+    if not path.exists():
+        return {"path": str(path), "rows": [], "rowCount": 0}
+    with ELECTION_LOCK:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            all_rows = list(reader)
+    return {"path": str(path), "rows": all_rows[-limit:], "rowCount": len(all_rows)}
+
+
+def _clear_election_csv(home_id: str) -> Dict[str, Any]:
+    path = _election_csv_path(home_id)
+    with ELECTION_LOCK:
+        if path.exists():
+            path.unlink()
+    return {"path": str(path), "rowCount": 0}
+
+
+def _send_csv_file(handler: SimpleHTTPRequestHandler, path: Path, download_name: str) -> None:
+    if not path.exists():
+        body = (",".join(ELECTION_CSV_FIELDS) + "\n").encode("utf-8")
+    else:
+        body = path.read_bytes()
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/csv; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _proxy_upstream(
+    method: str,
+    target_host: str,
+    path_qs: str,
+    cookie: str,
+    body: Optional[bytes] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    if target_host not in ALLOWED_HOSTS:
+        return 400, {"ok": False, "error": f"host not allowed: {target_host}"}
+
+    if target_host in ("127.0.0.1", "localhost"):
+        base = f"http://{target_host}:{API_PORT}"
+    else:
+        base = f"https://{target_host}:{API_PORT}"
+
+    url = f"{base}{path_qs}"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "groupAppControl/1.0",
+        "Referer": f"{base}/",
+        "Origin": base,
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    if body is not None:
+        headers["Content-Type"] = "application/json;charset=UTF-8"
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {"raw": raw}
+            return resp.status, {"ok": True, "status": resp.status, "data": data}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {"raw": raw}
+        return exc.code, {"ok": False, "status": exc.code, "error": str(exc.reason), "data": data}
+    except Exception as exc:
+        return 502, {
+            "ok": False,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+
+class AppHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
+
+    def end_headers(self) -> None:
+        # Avoid stale app.js/css/favicon after local edits
+        if (
+            self.path.startswith("/app.js")
+            or self.path.startswith("/flow.js")
+            or self.path.startswith("/style.css")
+            or self.path.startswith("/index")
+            or self.path.startswith("/favicon")
+            or self.path.startswith("/app-icon")
+        ):
+            self.send_header("Cache-Control", "no-store, max-age=0")
+        super().end_headers()
+
+    def log_message(self, fmt: str, *args) -> None:
+        sys.stderr.write("[groupAppControl] " + (fmt % args) + "\n")
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Cookie, X-Target-Host")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/health":
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "service": "groupAppControl",
+                    "port": DEFAULT_PORT,
+                    "storeFile": str(STORE_FILE),
+                },
+            )
+
+        if path == "/api/store":
+            store = _load_store()
+            return _json_response(
+                self,
+                200,
+                {"ok": True, "store": store, "path": str(STORE_FILE)},
+            )
+
+        if path == "/api/config":
+            return _json_response(
+                self,
+                200,
+                {
+                    "envs": [
+                        {
+                            "host": h,
+                            "name": n["name"],
+                            "short": n["short"],
+                            "region": n["region"],
+                            "supported": n["supported"],
+                        }
+                        for h, n in ENV_CONFIG.items()
+                    ],
+                },
+            )
+
+        if path == "/api/proxy/pid-schema":
+            return self._handle_proxy_get("/api/wireman-kong/ems/energy-device/pid-schema")
+
+        if path == "/api/proxy/property-query":
+            return self._handle_proxy_get("/api/wireman-kong/ems/energy-device/property/query")
+
+        if path == "/api/proxy/protocol-query":
+            return self._handle_proxy_get("/api/wireman-kong/ems/energy-device/protocol/query")
+
+        if path == "/api/proxy/query-neko":
+            return self._handle_proxy_get("/api/wireman-kong/ems/energy-device/query-neko")
+
+        if path == "/api/proxy/high-frequency":
+            return self._handle_proxy_get("/api/smartenergy-kong/group/high/frequency")
+
+        if path == "/api/election/settings":
+            qs = parse_qs(parsed.query)
+            home_id = (qs.get("homeId") or [""])[0]
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "intervalSec": _election_interval_for(home_id),
+                    "settings": _load_election_settings(),
+                    "csvPath": str(_election_csv_path(home_id)) if home_id else str(ELECTION_DIR),
+                },
+            )
+
+        if path == "/api/election/rows":
+            qs = parse_qs(parsed.query)
+            home_id = (qs.get("homeId") or [""])[0]
+            if not home_id:
+                return _json_response(self, 400, {"ok": False, "error": "missing homeId"})
+            try:
+                limit = int((qs.get("limit") or ["800"])[0])
+            except Exception:
+                limit = 800
+            data = _read_election_rows(home_id, limit)
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "homeId": home_id,
+                    "intervalSec": _election_interval_for(home_id),
+                    **data,
+                },
+            )
+
+        if path == "/api/election/download":
+            qs = parse_qs(parsed.query)
+            home_id = (qs.get("homeId") or [""])[0]
+            if not home_id:
+                return _json_response(self, 400, {"ok": False, "error": "missing homeId"})
+            path_csv = _election_csv_path(home_id)
+            return _send_csv_file(self, path_csv, f"election_{_safe_home_key(home_id)}.csv")
+
+        if path in ("/", "/index.html"):
+            self.path = "/index.html"
+        return super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/store":
+            body = _read_json(self)
+            try:
+                saved = _save_store(body.get("store") if isinstance(body.get("store"), dict) else body)
+            except Exception as exc:
+                return _json_response(
+                    self,
+                    500,
+                    {"ok": False, "error": str(exc), "traceback": traceback.format_exc()},
+                )
+            return _json_response(
+                self,
+                200,
+                {"ok": True, "store": saved, "path": str(STORE_FILE)},
+            )
+
+        if path == "/api/proxy/issue":
+            return self._handle_proxy_post("/api/wireman-kong/ems/energy-device/issue")
+
+        if path == "/api/proxy/group-device-issue":
+            return self._handle_proxy_post("/api/wireman-kong/ems/energy-group/device/issue")
+
+        if path == "/api/proxy/shadow-property":
+            return self._handle_proxy_post(
+                "/api/wireman-kong/ems/energy-device/query-shadow-property"
+            )
+
+        if path == "/api/proxy/bizlog-search":
+            return self._handle_proxy_post("/api/bizlog/search")
+
+        if path == "/api/election/settings":
+            body = _read_json(self)
+            try:
+                saved = _save_election_settings(body)
+                home_id = str(body.get("homeId") or "").strip()
+                return _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "settings": saved,
+                        "intervalSec": _election_interval_for(home_id) if home_id else saved.get("intervalSec"),
+                    },
+                )
+            except Exception as exc:
+                return _json_response(
+                    self,
+                    500,
+                    {"ok": False, "error": str(exc), "traceback": traceback.format_exc()},
+                )
+
+        if path == "/api/election/append":
+            body = _read_json(self)
+            home_id = str(body.get("homeId") or "").strip()
+            rows = body.get("rows")
+            if not home_id:
+                return _json_response(self, 400, {"ok": False, "error": "missing homeId"})
+            if not isinstance(rows, list) or not rows:
+                return _json_response(self, 400, {"ok": False, "error": "missing rows"})
+            try:
+                meta = _append_election_rows(home_id, rows)
+                return _json_response(self, 200, {"ok": True, "homeId": home_id, **meta})
+            except Exception as exc:
+                return _json_response(
+                    self,
+                    500,
+                    {"ok": False, "error": str(exc), "traceback": traceback.format_exc()},
+                )
+
+        if path == "/api/election/clear":
+            body = _read_json(self)
+            home_id = str(body.get("homeId") or "").strip()
+            if not home_id:
+                return _json_response(self, 400, {"ok": False, "error": "missing homeId"})
+            try:
+                meta = _clear_election_csv(home_id)
+                return _json_response(self, 200, {"ok": True, "homeId": home_id, **meta})
+            except Exception as exc:
+                return _json_response(
+                    self,
+                    500,
+                    {"ok": False, "error": str(exc), "traceback": traceback.format_exc()},
+                )
+
+        return _json_response(self, 404, {"ok": False, "error": "not found"})
+
+    def _proxy_meta(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return (host, cookie, error)."""
+        host = self.headers.get("X-Target-Host") or ""
+        cookie = self.headers.get("X-Cookie") or ""
+        if not host:
+            qs = parse_qs(urlparse(self.path).query)
+            host = (qs.get("host") or [""])[0]
+        if not host:
+            return None, None, "missing X-Target-Host"
+        if host not in ALLOWED_HOSTS:
+            return None, None, f"host not allowed: {host}"
+        return host, cookie, None
+
+    def _handle_proxy_get(self, api_path: str) -> None:
+        host, cookie, err = self._proxy_meta()
+        if err:
+            return _json_response(self, 400, {"ok": False, "error": err})
+
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        # strip our helper params
+        forward = {k: v[0] for k, v in qs.items() if k not in ("host",)}
+        path_qs = api_path
+        if forward:
+            path_qs += "?" + urllib.parse.urlencode(forward)
+
+        status, payload = _proxy_upstream("GET", host, path_qs, cookie or "")
+        return _json_response(self, 200 if payload.get("ok") else status, payload)
+
+    def _handle_proxy_post(self, api_path: str) -> None:
+        host, cookie, err = self._proxy_meta()
+        if err:
+            return _json_response(self, 400, {"ok": False, "error": err})
+
+        body_obj = _read_json(self)
+        body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+        status, payload = _proxy_upstream("POST", host, api_path, cookie or "", body)
+        return _json_response(self, 200 if payload.get("ok") else status, payload)
+
+
+ENV_CONFIG = {
+    "newenergy-operation-cn.wgine-inc.com": {
+        "name": "中国预发",
+        "short": "CN-Pre",
+        "region": "cn",
+        "supported": True,
+    },
+    "newenergy-operation-cn.tuya-inc.com": {
+        "name": "中国线上",
+        "short": "CN-Prod",
+        "region": "cn",
+        "supported": True,
+    },
+    "newenergy-operation-eu.wgine-inc.com": {
+        "name": "欧洲预发",
+        "short": "EU-Pre",
+        "region": "eu",
+        "supported": False,
+    },
+    "newenergy-operation-eu.tuya-inc.com": {
+        "name": "欧洲线上",
+        "short": "EU-Prod",
+        "region": "eu",
+        "supported": False,
+    },
+    "newenergy-operation-us.wgine-inc.com": {
+        "name": "美国预发",
+        "short": "US-Pre",
+        "region": "us",
+        "supported": False,
+    },
+    "newenergy-operation-us.tuya-inc.com": {
+        "name": "美国线上",
+        "short": "US-Prod",
+        "region": "us",
+        "supported": False,
+    },
+    "newenergy-operation-sg.tuya-inc.com": {
+        "name": "新加坡线上",
+        "short": "SG-Prod",
+        "region": "sg",
+        "supported": False,
+    },
+    "newenergy-operation-weaz.tuya-inc.com": {
+        "name": "西欧线上",
+        "short": "WEAZ",
+        "region": "weaz",
+        "supported": False,
+    },
+    "newenergy-operation-ueaz.tuya-inc.com": {
+        "name": "美东线上",
+        "short": "UEAZ",
+        "region": "ueaz",
+        "supported": False,
+    },
+    "127.0.0.1": {"name": "本机", "short": "Local", "region": "local", "supported": True},
+    "localhost": {"name": "本机", "short": "Local", "region": "local", "supported": True},
+}
+
+
+def _lan_ips():
+    """Best-effort list of non-loopback IPv4 addresses for LAN URL hints."""
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127.") and ip not in ips:
+            ips.insert(0, ip)
+    except OSError:
+        pass
+    return ips
+
+
+def main() -> None:
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not STORE_FILE.exists():
+        _save_store(_default_store())
+    server = ThreadingHTTPServer((DEFAULT_HOST, DEFAULT_PORT), AppHandler)
+    print(f"groupAppControl listening on {DEFAULT_HOST}:{DEFAULT_PORT}")
+    print(f"  本机:   http://127.0.0.1:{DEFAULT_PORT}")
+    for ip in _lan_ips():
+        print(f"  局域网: http://{ip}:{DEFAULT_PORT}")
+    if DEFAULT_HOST in ("127.0.0.1", "localhost"):
+        print("  (仅本机；设 DEVICE_CONSOLE_HOST=0.0.0.0 可开放局域网)")
+    print(f"store file: {STORE_FILE}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
+if __name__ == "__main__":
+    main()
