@@ -1,10 +1,9 @@
 __pycache__/
 *.py[cod]
+*$py.class
+.idea/
 .DS_Store
-*.log
-.groupAppControl.pid
-.groupAppControl.log
-data/store.json
-data/election/*.csv
-data/election_settings.json
-!.gitkeep
+*.zip
+.env
+.env.*
+!.env.example

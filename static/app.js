@@ -82,9 +82,10 @@ const HESTIA_ENVS = {
 const METER_PID = "7sndpedu8g2tkzvi";
 const METER_DP_ID = "29";
 const METER_DP_CODE = "active_power";
-/** 三方电表：功率取自一体机并网口 */
+/** 三方电表 / 无电表时电网节点：一体机「局域网电表配对功率」DP26 */
 const METER_THIRD_DP_ID = "26";
 const METER_THIRD_DP_CODE = "grid_power";
+const METER_THIRD_MODEL_CODE = "meter_power";
 const BIZLOG_EVENT_IDS =
   "1,2,3,4,5,6,7,8,9,10,11,12,13,14,21,36,38,39,40,41,42,43,44,45,46,47,51,52,53,54,56,57,59,60,61,62,63";
 
@@ -118,14 +119,21 @@ const UNKNOWN_MODEL = { id: "unknown", label: "未知型号", badge: "未知", m
 const DP_DISPLAY = [
   { code: "pv_power_total", label: "发电功率", unit: "W", tone: "", aliases: ["pv_power_total"] },
   { code: "battery_power", label: "电池功率", unit: "W", tone: "green", aliases: ["battery_power"] },
-  { code: "grid_port_power", label: "并网口", unit: "W", tone: "blue", aliases: ["grid_port_power", "inverter_output_power", "grid_power"] },
+  {
+    code: "grid_port_power",
+    label: "并网口",
+    unit: "W",
+    tone: "blue",
+    // DP27：勿与 DP26 grid_power/meter_power（局域网电表配对功率）混用
+    aliases: ["grid_port_power", "inverter_output_power"],
+  },
   { code: "current_soc", label: "SOC", unit: "%", tone: "", aliases: ["current_soc", "main_soc"] },
   {
     code: "battery_charging_power_grid",
     label: "离网口",
     unit: "W",
     tone: "",
-    aliases: ["battery_charging_power_grid", "offgrid1_export_power"],
+    aliases: ["offgrid1_export_power", "battery_charging_power_grid"],
   },
 ];
 
@@ -163,8 +171,30 @@ const DP_SHADOW_EXTRA = [
     unit: "kWh",
     aliases: ["battery_capacity"],
   },
+  {
+    // DP26：局域网电表配对功率（无实体电表时供「电网 Grid」节点显示）
+    code: "meter_power",
+    label: "局域网电表配对功率",
+    unit: "W",
+    aliases: ["meter_power", "grid_power"],
+    dpCode: "grid_power",
+    fallbackDpId: METER_THIRD_DP_ID,
+  },
+  {
+    // DP98：多机协同实际工况（主机报文含全员；从机仅本机）
+    code: "command_receive",
+    label: "协同命令接收",
+    unit: "",
+    aliases: ["command_receive"],
+    dpCode: "command_receive",
+    fallbackDpId: "98",
+    dpSchema: { type: "raw", maxlen: 128 },
+  },
 ];
 const DP_SHADOW_EXTRA_CODES = DP_SHADOW_EXTRA.map((d) => d.code);
+
+/** DP98 主机编号：固定 0x0A 表示本机主机槽位 */
+const DP98_MASTER_NUMER = 0x0a;
 
 /** Home-side params: issue to every device in the home. */
 const HOME_FAMILY_FIELDS = [
@@ -237,6 +267,12 @@ const DEVICE_MODEL_READONLY = [
     via: "function_set",
     unit: "",
   },
+  {
+    code: "device_cluster_node_id",
+    label: "集群身份id",
+    via: "function_set",
+    unit: "",
+  },
 ];
 
 /** 所有需从 property-query 拉取的物模型 code */
@@ -260,15 +296,57 @@ function clusterRoleLabel(raw) {
   return String(raw);
 }
 
-/** 仅 0/1 放入一体机集群框；其它（含未读）按单机摆放。 */
-function isClusterBoxMember(deviceOrRaw) {
+/**
+ * 集群身份 id（function_set / device_cluster_node_id）。
+ * @returns {string|null} 有值返回规范化字符串；空/未读返回 null（按单机）
+ */
+function deviceClusterNodeId(deviceOrRaw) {
   const raw =
     deviceOrRaw && typeof deviceOrRaw === "object"
-      ? deviceOrRaw.values?.device_cluster_role
+      ? deviceOrRaw.values?.device_cluster_node_id
       : deviceOrRaw;
-  if (raw == null || raw === "") return false;
-  const n = Number(raw);
-  return n === 0 || n === 1;
+  if (raw == null || raw === "") return null;
+  const s = String(raw).trim();
+  return s === "" ? null : s;
+}
+
+/** 有 device_cluster_node_id 则进对应集群框；否则单机。 */
+function isClusterBoxMember(deviceOrRaw) {
+  return deviceClusterNodeId(deviceOrRaw) != null;
+}
+
+/**
+ * 按 device_cluster_node_id 分多集群；无 id 的进 solos。
+ * 集群内优先主机(role=0)，再从机，其余按原序。
+ * @returns {{ clusters: { nodeId: string, devices: object[] }[], solos: object[] }}
+ */
+function groupDevicesByCluster(devices) {
+  const list = Array.isArray(devices) ? devices : [];
+  const byNode = new Map();
+  const solos = [];
+  for (const d of list) {
+    const nid = deviceClusterNodeId(d);
+    if (nid == null) {
+      solos.push(d);
+      continue;
+    }
+    if (!byNode.has(nid)) byNode.set(nid, []);
+    byNode.get(nid).push(d);
+  }
+  const roleRank = (d) => {
+    const n = Number(d?.values?.device_cluster_role);
+    if (n === 0) return 0;
+    if (n === 1) return 1;
+    if (Number.isFinite(n)) return 10 + n;
+    return 99;
+  };
+  const clusters = [...byNode.entries()]
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0]), "en"))
+    .map(([nodeId, devs]) => ({
+      nodeId,
+      devices: [...devs].sort((a, b) => roleRank(a) - roleRank(b)),
+    }));
+  return { clusters, solos };
 }
 
 /**
@@ -324,7 +402,8 @@ function classifyOwnerWorkModel(device) {
     v.grid_port_power != null ||
     v.grid_power != null ||
     v.inverter_output_power != null ||
-    v.battery_charging_power_grid != null;
+    v.battery_charging_power_grid != null ||
+    v.offgrid1_export_power != null;
   if (!hasLive && !device.reportTime) return null;
 
   const modelMetaObj = typeof modelMeta === "function" ? modelMeta(device) : null;
@@ -334,7 +413,7 @@ function classifyOwnerWorkModel(device) {
   const soc = _ownerNum(v.current_soc ?? v.main_soc, NaN);
   const back = _ownerNum(v.backup_soc ?? v.backup_reserve, 20);
   const pv = Math.max(0, _ownerNum(v.pv_power_total, 0));
-  const bypass = _ownerNum(v.battery_charging_power_grid ?? v.offgrid1_export_power, 0);
+  const bypass = _ownerNum(v.offgrid1_export_power ?? v.battery_charging_power_grid, 0);
   const batChg = _ownerNum(v.bat_max_chg_w ?? v.battery_max_charge_power, invCap);
   const batDchg = _ownerNum(v.bat_max_dchg_w ?? v.battery_max_discharge_power, invCap);
   const outLim = _ownerNum(v.output_power_limit || v.regulation_grid_export_p_limit, invCap) || invCap;
@@ -596,6 +675,198 @@ function openOwnerStrategyDialog(home, device) {
   else dlg.setAttribute("open", "");
 }
 
+/* ---------- DP98 command_receive：实际工况解析 / 编号匹配 ---------- */
+
+function _rawToBytes(raw) {
+  if (raw == null || raw === "") return null;
+  if (raw instanceof Uint8Array) return raw;
+  if (Array.isArray(raw)) return Uint8Array.from(raw.map((x) => Number(x) & 0xff));
+  if (typeof raw === "object") {
+    if (raw.data != null) return _rawToBytes(raw.data);
+    if (raw.value != null) return _rawToBytes(raw.value);
+    if (raw.dpValue != null) return _rawToBytes(raw.dpValue);
+  }
+  const s = String(raw).trim().replace(/^"|"$/g, "");
+  if (!s) return null;
+
+  const fromB64 = (text) => {
+    try {
+      const bin = atob(text);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    } catch (_) {
+      return null;
+    }
+  };
+  const looksDp98 = (out) =>
+    !!out &&
+    out.length >= 8 &&
+    ((out[0] === 0x01 && out[1] === 0x03 && out[2] === 0x01) ||
+      (out[0] === 0x03 && out[1] === 0x01) ||
+      (out[0] === 0x01 && out[1] === 0x01 && out[2] === 0x80));
+
+  // 云端影子 DP98 几乎总是 base64（如 AQMBAQ…）
+  if (/^[A-Za-z0-9+/=\s]+$/.test(s) && /[A-Za-z]/.test(s)) {
+    const compact = s.replace(/\s+/g, "");
+    const pad = compact + "=".repeat((4 - (compact.length % 4)) % 4);
+    const out = fromB64(pad);
+    if (looksDp98(out)) return out;
+  }
+
+  const hex = s.replace(/[\s,]/g, "");
+  if (/^[0-9a-fA-F]+$/.test(hex) && hex.length % 2 === 0) {
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    }
+    if (looksDp98(out) || out.length >= 8) return out;
+  }
+
+  const loose = fromB64(s.replace(/\s+/g, ""));
+  return looksDp98(loose) ? loose : loose;
+}
+
+function _asI16(u16) {
+  const n = Number(u16) & 0xffff;
+  return n > 32767 ? n - 65536 : n;
+}
+
+/**
+ * 解析 DP98 / command_receive raw。
+ * 格式：fnlFlag + 03 01 + 重复(01 01 addr_be val_be)；地址自 0x8000 起每台 7 个寄存器。
+ * @returns {{ fnlFlag: number|null, units: Array<object> }|null}
+ */
+function parseDp98CommandReceive(raw) {
+  const bytes = _rawToBytes(raw);
+  if (!bytes || bytes.length < 8) return null;
+  let i = 0;
+  let fnlFlag = null;
+  if (bytes[1] === 0x03 && bytes[2] === 0x01) {
+    fnlFlag = bytes[0];
+    i = 3;
+  } else if (bytes[0] === 0x03 && bytes[1] === 0x01) {
+    i = 2;
+  }
+  const byAddr = new Map();
+  while (i + 5 < bytes.length) {
+    if (bytes[i] === 0x01 && bytes[i + 1] === 0x01) {
+      const addr = ((bytes[i + 2] << 8) | bytes[i + 3]) & 0xffff;
+      const val = ((bytes[i + 4] << 8) | bytes[i + 5]) & 0xffff;
+      byAddr.set(addr, val);
+      i += 6;
+      continue;
+    }
+    i += 1;
+  }
+  if (!byAddr.size) return null;
+  const bucket = new Map();
+  for (const [addr, val] of byAddr) {
+    if (addr < 0x8000) continue;
+    const off = addr - 0x8000;
+    const idx = Math.floor(off / 7);
+    const field = off % 7;
+    if (!bucket.has(idx)) bucket.set(idx, {});
+    bucket.get(idx)[`f${field}`] = val;
+  }
+  const units = [...bucket.keys()]
+    .sort((a, b) => a - b)
+    .map((idx) => {
+      const u = bucket.get(idx) || {};
+      const model = Number(u.f1 || 0) & 0xff;
+      return {
+        numer: Number(u.f0 || 0) & 0xff,
+        workModel: model,
+        label: OWNER_WORK_MODEL_CN[model] || `0x${model.toString(16)}`,
+        chgCapW: Math.max(0, _asI16(u.f2 || 0)),
+        dchgCapW: Math.max(0, _asI16(u.f3 || 0)),
+        pvW: Math.max(0, Number(u.f4 || 0) & 0xffff),
+        cmdPowerW: Math.max(0, Number(u.f5 || 0) & 0xffff),
+        order: Number(u.f6 || 0) & 0xff,
+      };
+    });
+  return { fnlFlag, units };
+}
+
+function dp98UnitToActual(unit, extra = {}) {
+  if (!unit) return null;
+  return {
+    model: unit.workModel,
+    label: unit.label,
+    chgCapW: unit.chgCapW,
+    dchgCapW: unit.dchgCapW,
+    pvW: unit.pvW,
+    cmdPowerW: unit.cmdPowerW,
+    order: unit.order,
+    numer: unit.numer,
+    source: extra.source || "dp98",
+    fromMaster: !!extra.fromMaster,
+  };
+}
+
+/**
+ * 集群内：DP98 编号 → 设备。
+ * 0x0A → 主机(role=0)；1..N → 同集群从机，按 deviceId 稳定排序。
+ */
+function mapDp98NumerToDevice(members, numer) {
+  const n = Number(numer) & 0xff;
+  const list = members || [];
+  const master = list.find((d) => Number(d?.values?.device_cluster_role) === 0) || null;
+  const slaves = list
+    .filter((d) => d && d !== master && Number(d.values?.device_cluster_role) === 1)
+    .slice()
+    .sort((a, b) => String(a.deviceId || "").localeCompare(String(b.deviceId || ""), "en"));
+  if (n === DP98_MASTER_NUMER) return master;
+  if (n >= 1 && n <= slaves.length) return slaves[n - 1];
+  return null;
+}
+
+/**
+ * 用主机 DP98 给集群成员打实际状态；无主机报文时回退各机自己的 DP98。
+ */
+function applyDp98ActualForHome(home) {
+  if (!home) return;
+  const devices = home.devices || [];
+  for (const d of devices) d.ownerActual = null;
+
+  const grouped =
+    typeof groupDevicesByCluster === "function"
+      ? groupDevicesByCluster(devices)
+      : { clusters: [], solos: devices };
+
+  const applyOwn = (d) => {
+    const parsed = parseDp98CommandReceive(d.values?.command_receive);
+    if (!parsed?.units?.length) return;
+    // 从机自报文通常只有一组且编号=1；单机也可能是 0x0A/1
+    const unit =
+      parsed.units.find((u) => u.numer === DP98_MASTER_NUMER) ||
+      parsed.units.find((u) => u.numer === 1) ||
+      parsed.units[0];
+    d.ownerActual = dp98UnitToActual(unit, { fromMaster: false, source: "dp98-self" });
+  };
+
+  for (const cluster of grouped.clusters || []) {
+    const members = cluster.devices || [];
+    const master = members.find((d) => Number(d?.values?.device_cluster_role) === 0);
+    const parsed = parseDp98CommandReceive(master?.values?.command_receive);
+    if (parsed?.units?.length) {
+      for (const unit of parsed.units) {
+        const target = mapDp98NumerToDevice(members, unit.numer);
+        if (!target) continue;
+        target.ownerActual = dp98UnitToActual(unit, { fromMaster: true, source: "dp98-master" });
+      }
+      // 未匹配到的成员再试本机报文
+      for (const d of members) {
+        if (!d.ownerActual) applyOwn(d);
+      }
+      continue;
+    }
+    for (const d of members) applyOwn(d);
+  }
+
+  for (const d of grouped.solos || []) applyOwn(d);
+}
+
 /** 一体机「更多点位」对照表（dpid / dpcode / 物模型 code） */
 const DEVICE_MORE_POINTS = [
   { dpId: "51", dpCode: "work_mode", modelCode: "work_mode", unit: "", valueKeys: ["work_mode"] },
@@ -627,6 +898,13 @@ const DEVICE_MORE_POINTS = [
     unit: "",
     valueKeys: ["device_cluster_role"],
   },
+  {
+    dpId: "52",
+    dpCode: "function_set",
+    modelCode: "device_cluster_node_id",
+    unit: "",
+    valueKeys: ["device_cluster_node_id"],
+  },
   { dpId: "91", dpCode: "base_load", modelCode: "base_load", unit: "W", valueKeys: ["base_load"] },
   {
     dpId: "20",
@@ -647,7 +925,14 @@ const DEVICE_MORE_POINTS = [
     dpCode: "inverter_output_power",
     modelCode: "grid_port_power",
     unit: "W",
-    valueKeys: ["grid_port_power", "inverter_output_power", "grid_power", "meter_power"],
+    valueKeys: ["grid_port_power", "inverter_output_power"],
+  },
+  {
+    dpId: "26",
+    dpCode: "grid_power",
+    modelCode: "meter_power",
+    unit: "W",
+    valueKeys: ["meter_power", "grid_power"],
   },
   {
     dpId: "23",
@@ -657,11 +942,11 @@ const DEVICE_MORE_POINTS = [
     valueKeys: ["current_soc", "main_soc", "heap_soc"],
   },
   {
-    dpId: "29",
-    dpCode: "battery_charging_power_grid",
+    dpId: "38",
+    dpCode: "offgrid1_export_power",
     modelCode: "battery_charging_power_grid",
     unit: "W",
-    valueKeys: ["battery_charging_power_grid", "offgrid1_export_power"],
+    valueKeys: ["offgrid1_export_power", "battery_charging_power_grid"],
   },
   {
     dpId: "50",
@@ -749,6 +1034,179 @@ function openDevicePointsDialog(home, device) {
   document.getElementById("dlgDevicePoints").showModal();
 }
 
+/** Normalize register address for protocol-model strategySpecString (hex digits, no 0x). */
+function normalizeRegAddrInput(raw) {
+  let s = String(raw || "").trim();
+  if (!s) return "";
+  s = s.replace(/^0x/i, "").replace(/\s+/g, "");
+  if (!/^[0-9a-fA-F]+$/.test(s)) return "";
+  return s.toLowerCase().replace(/^0+(?=[0-9a-f])/, "") || "0";
+}
+
+let regQueryCtx = null; // { home, device, protocol }
+
+/**
+ * Step1: protocol/query → energyModelType / protocolCode / protocolPlan
+ */
+async function fetchDeviceProtocolInfo(home, device) {
+  const res = await apiGet("/api/proxy/protocol-query", home, { deviceId: device.deviceId });
+  const data = unwrapResult(res);
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || typeof row !== "object") {
+    throw new Error("protocol/query 无数据");
+  }
+  const energyModelType = row.energyModelType || row.modelType || "";
+  const protocolCode = row.protocolCode != null ? String(row.protocolCode) : "";
+  const protocolPlan = row.protocolPlan != null ? String(row.protocolPlan) : "";
+  if (!energyModelType || protocolCode === "") {
+    throw new Error("缺少 energyModelType / protocolCode");
+  }
+  const protocol = { energyModelType, protocolCode, protocolPlan };
+  device.protocol = { ...(device.protocol || {}), ...protocol };
+  return protocol;
+}
+
+/**
+ * Step2: protocol-model page by register → code
+ */
+async function lookupCodeByRegister(home, protocol, regHex) {
+  const res = await apiGet("/api/proxy/protocol-model-page", home, {
+    energyModelType: protocol.energyModelType,
+    protocolCode: protocol.protocolCode,
+    sortType: "",
+    page: "1",
+    strategySpecString: regHex,
+    perPage: "10",
+  });
+  const data = unwrapResult(res);
+  const list = Array.isArray(data)
+    ? data
+    : data?.list || data?.records || data?.items || data?.rows || [];
+  if (!list.length) {
+    throw new Error(`未找到寄存器 ${regHex} 对应物模型`);
+  }
+  // Prefer exact register match when multiple hits
+  const want = regHex.toLowerCase();
+  const exact = list.find((it) => {
+    const addr = parseRegAddr(it?.model?.strategySpec || it?.strategySpec);
+    if (addr == null) return false;
+    return addr.toString(16).toLowerCase() === want;
+  });
+  const hit = exact || list[0];
+  const code = hit.code || hit.modelCode || hit?.model?.code;
+  if (!code) throw new Error("反查结果无 code");
+  return { code: String(code), hit, list };
+}
+
+/**
+ * Step3: property/query by code → value
+ */
+async function fetchPropertyByCode(home, device, code) {
+  const res = await apiGet("/api/proxy/property-query", home, {
+    page: "1",
+    deviceId: device.deviceId,
+    code,
+  });
+  const data = unwrapResult(res);
+  const items = Array.isArray(data) ? data : data?.data || data?.items || data?.list || [];
+  const hit =
+    (Array.isArray(items) && items.find((it) => (it.code || it.dpCode) === code)) ||
+    (Array.isArray(items) && items[0]) ||
+    null;
+  return { items: Array.isArray(items) ? items : [], hit };
+}
+
+function renderRegQueryMeta(protocol, errText) {
+  const el = document.getElementById("regQueryMeta");
+  if (!el) return;
+  if (errText) {
+    el.innerHTML = `<span style="color:#b91c1c">${escapeHtml(errText)}</span>`;
+    return;
+  }
+  if (!protocol) {
+    el.textContent = "加载协议信息…";
+    return;
+  }
+  el.innerHTML = `
+    <div><b>energyModelType</b> · <code>${escapeHtml(protocol.energyModelType)}</code></div>
+    <div><b>protocolCode</b> · <code>${escapeHtml(protocol.protocolCode)}</code></div>
+    <div><b>protocolPlan</b> · <code>${escapeHtml(protocol.protocolPlan || "—")}</code></div>`;
+}
+
+async function openRegQueryDialog(home, device) {
+  if (!home || !device) return;
+  const dlg = document.getElementById("dlgRegQuery");
+  if (!dlg) return;
+  regQueryCtx = { home, device, protocol: null };
+  document.getElementById("dlgRegQueryTitle").textContent = `寄存器值查询 · ${
+    device.name || device.deviceId
+  }`;
+  document.getElementById("dlgRegQueryHint").textContent = `设备 ID ${device.deviceId}`;
+  document.getElementById("regQueryAddr").value = "";
+  const resultEl = document.getElementById("regQueryResult");
+  resultEl.hidden = true;
+  resultEl.textContent = "";
+  renderRegQueryMeta(null);
+  dlg.showModal();
+
+  try {
+    const protocol = await fetchDeviceProtocolInfo(home, device);
+    if (regQueryCtx?.device?.uid !== device.uid) return;
+    regQueryCtx.protocol = protocol;
+    renderRegQueryMeta(protocol);
+  } catch (err) {
+    renderRegQueryMeta(null, err.message || String(err));
+  }
+}
+
+async function runRegQuery() {
+  const ctx = regQueryCtx;
+  if (!ctx?.home || !ctx?.device) return;
+  const btn = document.getElementById("btnRegQueryRun");
+  const resultEl = document.getElementById("regQueryResult");
+  const addrRaw = document.getElementById("regQueryAddr")?.value || "";
+  const regHex = normalizeRegAddrInput(addrRaw);
+  if (!regHex) {
+    toast("请输入有效寄存器地址（如 4026 或 0x4026）", "error");
+    return;
+  }
+  if (btn) btn.disabled = true;
+  resultEl.hidden = false;
+  resultEl.textContent = "查询中…";
+  try {
+    let protocol = ctx.protocol;
+    if (!protocol?.energyModelType || protocol.protocolCode == null || protocol.protocolCode === "") {
+      protocol = await fetchDeviceProtocolInfo(ctx.home, ctx.device);
+      ctx.protocol = protocol;
+      renderRegQueryMeta(protocol);
+    }
+    const looked = await lookupCodeByRegister(ctx.home, protocol, regHex);
+    const prop = await fetchPropertyByCode(ctx.home, ctx.device, looked.code);
+    const hit = prop.hit;
+    const value =
+      hit == null
+        ? null
+        : hit.valueObject ?? hit.value ?? hit.dpValue ?? hit.propertyValue ?? null;
+    const lines = [
+      `寄存器: 0x${regHex}`,
+      `code: ${looked.code}`,
+      `名称: ${hit?.name || looked.hit?.name || "—"}`,
+      `值: ${value == null || value === "" ? "—" : typeof value === "object" ? JSON.stringify(value) : value}`,
+      `时间: ${hit?.time || hit?.reportTime || hit?.gmtModified || "—"}`,
+    ];
+    if (looked.list.length > 1) {
+      lines.push(`(协议模型命中 ${looked.list.length} 条，已取 ${looked.code})`);
+    }
+    resultEl.textContent = lines.join("\n");
+    toast("查询完成", "ok");
+  } catch (err) {
+    resultEl.textContent = `失败: ${err.message || err}`;
+    toast(err.message || String(err), "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 /**
  * @typedef {{
  *   uid: string,
@@ -816,6 +1274,8 @@ function normalizeHome(h) {
     lastReadAt: null, // 仅会话内，不从 store 回显
     devices,
     meters: (h.meters || []).map((m) => normalizeMeter(m, h.envHost)),
+    // 无实体电表时：电网节点取该一体机 DP26（局域网电表配对功率）
+    lanMeterDeviceId: String(h.lanMeterDeviceId || "").trim(),
     // 家庭侧可下发参数：值仅会话内回显，草稿可持久
     familyValues: {},
     familyDrafts: h.familyDrafts || {},
@@ -1367,6 +1827,7 @@ function buildStoreDump() {
         isThirdParty: !!m.isThirdParty,
         hestiaHost: m.hestiaHost,
       })),
+      lanMeterDeviceId: h.lanMeterDeviceId || "",
       familyDrafts: h.familyDrafts || {},
       wiring: ensureHomeWiring(h),
     })),
@@ -1504,6 +1965,38 @@ function toast(msg, type = "") {
   toast._t = setTimeout(() => el.classList.add("hidden"), 3200);
 }
 
+/**
+ * Copy text to clipboard. Works on http://IP (non-secure) via execCommand fallback.
+ * navigator.clipboard requires secure context (https / localhost).
+ */
+async function copyText(text) {
+  const value = String(text ?? "");
+  if (!value) throw new Error("内容为空");
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch (_) {
+      /* fall through to legacy path */
+    }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = value;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  ta.setSelectionRange(0, value.length);
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } finally {
+    ta.remove();
+  }
+  if (!ok) throw new Error("浏览器禁止复制");
+}
+
 function fmtNum(v, unit) {
   if (v === null || v === undefined || v === "") return "—";
   const n = Number(v);
@@ -1542,6 +2035,26 @@ function countDrafts(device) {
   const wm = (device.drafts?.work_mode || "").trim();
   if (wm !== "" && String(device.values?.work_mode ?? "") !== wm) n += 1;
   return n;
+}
+
+const FAMILY_RAIL_FOLD_KEY = "gac.familyRailFold";
+
+function loadFamilyRailFold() {
+  try {
+    const raw = localStorage.getItem(FAMILY_RAIL_FOLD_KEY);
+    const obj = raw ? JSON.parse(raw) : {};
+    return obj && typeof obj === "object" ? obj : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveFamilyRailFold(next) {
+  try {
+    localStorage.setItem(FAMILY_RAIL_FOLD_KEY, JSON.stringify(next || {}));
+  } catch (_) {
+    /* ignore quota */
+  }
 }
 
 function countFamilyDrafts(home) {
@@ -1609,6 +2122,41 @@ function unwrapResult(payload) {
   return data;
 }
 
+/** Upstream sometimes returns SSO login HTML when cookie expired. */
+class AuthExpiredError extends Error {
+  constructor(message) {
+    super(message || "登录已失效");
+    this.name = "AuthExpiredError";
+    this.code = "AUTH_EXPIRED";
+  }
+}
+
+function isAuthExpiredPayload(json) {
+  const raw = json?.data?.raw;
+  if (typeof raw === "string" && /<!DOCTYPE|统一登录|login-form|password登录|涂鸦统一登录/i.test(raw)) {
+    return true;
+  }
+  const msg = String(
+    json?.data?.errorMsg || json?.data?.msg || json?.data?.message || json?.error || ""
+  );
+  if (/未登录|登录已过期|登录失效|login expired|unauthorized|无权限|请先登录/i.test(msg)) {
+    return true;
+  }
+  const code = json?.data?.code ?? json?.data?.errorCode;
+  if (code === 401 || code === "401") return true;
+  return false;
+}
+
+function assertProxyPayload(json) {
+  if (isAuthExpiredPayload(json)) {
+    throw new AuthExpiredError("登录已失效，正在尝试自动刷新 SSO…");
+  }
+  if (!json?.ok && json?.error) throw new Error(json.error);
+  if (json?.data && json.data.success === false) {
+    throw new Error(json.data.errorMsg || json.error || "请求失败");
+  }
+}
+
 function resolveCookie(host) {
   if (state.cookies[host]) return state.cookies[host];
   // fallback: any cookie (SSO often works across hestia/ops)
@@ -1622,7 +2170,25 @@ function hostOf(homeOrHost) {
   return typeof homeOrHost === "string" ? homeOrHost : homeOrHost.envHost;
 }
 
-async function apiGet(path, homeOrHost, query = {}) {
+/** Deduplicate concurrent auto-refresh during parallel reads. */
+let ssoRefreshPromise = null;
+
+async function refreshSsoCookieOnce(opts = {}) {
+  if (!ssoRefreshPromise) {
+    const notify = !!opts.notify;
+    ssoRefreshPromise = refreshSsoCookie({ ...opts, force: true })
+      .then((r) => {
+        if (notify) toast("登录已失效，已自动刷新 SSO 并重试", "ok");
+        return r;
+      })
+      .finally(() => {
+        ssoRefreshPromise = null;
+      });
+  }
+  return ssoRefreshPromise;
+}
+
+async function apiGet(path, homeOrHost, query = {}, _retried = false) {
   const host = hostOf(homeOrHost);
   const cookie = resolveCookie(host);
   const qs = new URLSearchParams(query).toString();
@@ -1634,14 +2200,28 @@ async function apiGet(path, homeOrHost, query = {}) {
     },
   });
   const json = await res.json();
-  if (!json.ok && json.error) throw new Error(json.error);
-  if (json.data && json.data.success === false) {
-    throw new Error(json.data.errorMsg || json.error || "请求失败");
+  try {
+    assertProxyPayload(json);
+    return json;
+  } catch (err) {
+    if (!_retried && err?.code === "AUTH_EXPIRED") {
+      try {
+        await refreshSsoCookieOnce({ quiet: true, skipRender: true, host, notify: true });
+      } catch (refreshErr) {
+        throw new AuthExpiredError(
+          `登录已失效，自动刷新失败：${refreshErr.message || refreshErr}`
+        );
+      }
+      return apiGet(path, homeOrHost, query, true);
+    }
+    if (err?.code === "AUTH_EXPIRED") {
+      throw new AuthExpiredError("登录已失效，自动刷新后仍失败，请手动点「自动获取」或重新粘贴 Cookie");
+    }
+    throw err;
   }
-  return json;
 }
 
-async function apiPost(path, homeOrHost, body) {
+async function apiPost(path, homeOrHost, body, _retried = false) {
   const host = hostOf(homeOrHost);
   const cookie = resolveCookie(host);
   const res = await fetch(path, {
@@ -1654,11 +2234,25 @@ async function apiPost(path, homeOrHost, body) {
     body: JSON.stringify(body),
   });
   const json = await res.json();
-  if (!json.ok && json.error) throw new Error(json.error);
-  if (json.data && json.data.success === false) {
-    throw new Error(json.data.errorMsg || json.error || "请求失败");
+  try {
+    assertProxyPayload(json);
+    return json;
+  } catch (err) {
+    if (!_retried && err?.code === "AUTH_EXPIRED") {
+      try {
+        await refreshSsoCookieOnce({ quiet: true, skipRender: true, host, notify: true });
+      } catch (refreshErr) {
+        throw new AuthExpiredError(
+          `登录已失效，自动刷新失败：${refreshErr.message || refreshErr}`
+        );
+      }
+      return apiPost(path, homeOrHost, body, true);
+    }
+    if (err?.code === "AUTH_EXPIRED") {
+      throw new AuthExpiredError("登录已失效，自动刷新后仍失败，请手动点「自动获取」或重新粘贴 Cookie");
+    }
+    throw err;
   }
-  return json;
 }
 
 function indexSchema(result) {
@@ -1689,7 +2283,14 @@ function indexSchema(result) {
 function resolveSchemaEntry(schemaMap, field) {
   const aliases = field.aliases || [field.code];
   for (const a of aliases) {
-    if (schemaMap[a]) return schemaMap[a];
+    if (schemaMap?.[a]) return schemaMap[a];
+  }
+  if (field?.fallbackDpId) {
+    return {
+      dpId: String(field.fallbackDpId),
+      dpCode: field.dpCode || field.code,
+      dpSchema: field.dpSchema || null,
+    };
   }
   return null;
 }
@@ -1720,6 +2321,16 @@ function fieldLabelHtml(device, field) {
  */
 function toDisplayValue(raw, dpSchema, displayUnit) {
   if (raw === null || raw === undefined || raw === "") return null;
+  // raw 型（DP98 command_receive 等）：原样保留 base64/hex 字符串，勿当数字
+  const schemaType = String(dpSchema?.type || "").toLowerCase();
+  if (schemaType === "raw" || schemaType === "rawtype") {
+    if (typeof raw === "string") return raw.trim();
+    if (typeof raw === "object") {
+      const inner = raw.value ?? raw.dpValue ?? raw.data ?? null;
+      if (inner != null) return toDisplayValue(inner, dpSchema, displayUnit);
+    }
+    return raw;
+  }
   let n = Number(raw);
   if (Number.isNaN(n)) return raw;
   const scale = Number(dpSchema?.scale ?? 0);
@@ -1845,11 +2456,17 @@ async function readDevice(home, device, opts = {}) {
     if (!batch) toast(`${device.name || device.deviceId}: ${device.error}`, "error");
   } finally {
     device.loading = false;
-    if (!batch) render();
+    if (!batch) {
+      applyDp98ActualForHome(home);
+      render();
+    }
   }
   // 物模型补读；SOC 历史仅「历史趋势」页拉取，实时页不调 query-neko
   if (ok && !batch) {
-    readDeviceHomeModelParams(home, device, { syncHome: true }).then(() => render());
+    readDeviceHomeModelParams(home, device, { syncHome: true }).then(() => {
+      applyDp98ActualForHome(home);
+      render();
+    });
   }
   return ok;
 }
@@ -2397,6 +3014,68 @@ function meterDpSpec(meter) {
     return { dpId: METER_THIRD_DP_ID, dpCode: METER_THIRD_DP_CODE, pid: null };
   }
   return { dpId: METER_DP_ID, dpCode: METER_DP_CODE, pid: METER_PID };
+}
+
+/**
+ * 无实体电表时，电网节点所用的一体机（DP26 / grid_power / meter_power）。
+ * 优先 home.lanMeterDeviceId；否则家庭内第一台。
+ * @param {object} home
+ * @returns {object|null}
+ */
+function resolveLanMeterDevice(home) {
+  const devices = home?.devices || [];
+  if (!devices.length) return null;
+  const want = String(home.lanMeterDeviceId || "").trim();
+  if (want) {
+    const hit = devices.find((d) => String(d.deviceId) === want);
+    if (hit) return hit;
+  }
+  return devices[0] || null;
+}
+
+/**
+ * 一体机「局域网电表配对功率」DP26，单位 W。
+ * @param {object|null} device
+ * @returns {number|null} null = 尚未读到
+ */
+function lanMeterPowerFromDevice(device) {
+  if (!device) return null;
+  const v = device.values || {};
+  const raw = v.meter_power ?? v.grid_power;
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * 电网节点展示功率：有电表用 lastValue；无电表用选中一体机 DP26。
+ * @returns {{ watts: number|null, source: "meter"|"lan"|"none", device: object|null, label: string }}
+ */
+function resolveGridNodePower(home) {
+  const meters = home?.meters || [];
+  const meter = meters[0];
+  const hasMeter =
+    meter?.lastValue != null &&
+    meter.lastValue !== "" &&
+    Number.isFinite(Number(meter.lastValue));
+  if (hasMeter) {
+    return {
+      watts: Number(meter.lastValue),
+      source: "meter",
+      device: null,
+      label: meter.name || meter.deviceId || "电表",
+    };
+  }
+  const device = resolveLanMeterDevice(home);
+  const watts = lanMeterPowerFromDevice(device);
+  return {
+    watts,
+    source: device ? "lan" : "none",
+    device,
+    label: device
+      ? `${device.name || device.deviceId} · DP26`
+      : "未选一体机",
+  };
 }
 
 async function readMeterShadowLive(home, meter) {
@@ -3467,6 +4146,15 @@ function renderMain() {
 
   const hasCookie = !!(state.cookies[home.envHost] || "").trim() || Object.values(state.cookies).some(Boolean);
   document.getElementById("cookieBanner").classList.toggle("hidden", hasCookie);
+  const onLocal = isLocalHostPage();
+  const bannerText = document.getElementById("cookieBannerText");
+  const bannerBtn = document.getElementById("btnAutoCookieBanner");
+  if (bannerText) {
+    bannerText.textContent = onLocal
+      ? "当前环境尚未配置 Cookie。可点「自动获取」从本机浏览器 SSO 填入，再「推送到虚拟机」。"
+      : "当前环境尚未配置 Cookie。请在本机自动获取后推送到虚拟机，或打开「登录态」手动粘贴。";
+  }
+  if (bannerBtn) bannerBtn.classList.toggle("hidden", !onLocal);
 
   document.getElementById("tabLive")?.classList.toggle("hidden", homeTab !== "live");
   document.getElementById("tabCharts")?.classList.toggle("hidden", homeTab !== "charts");
@@ -3563,7 +4251,7 @@ function renderMeterCard(home, meter) {
   });
   card.querySelector('[data-act="copy-id"]').addEventListener("click", async () => {
     try {
-      await navigator.clipboard.writeText(meter.deviceId);
+      await copyText(meter.deviceId);
       toast("已复制电表设备 ID", "ok");
     } catch (err) {
       toast(`复制失败: ${err.message || err}`, "error");
@@ -3748,18 +4436,8 @@ function renderDeviceCard(home, device) {
   });
 
   card.querySelector('[data-act="copy-id"]').addEventListener("click", async () => {
-    const text = device.deviceId;
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        ta.remove();
-      }
+      await copyText(device.deviceId);
       toast("已复制设备 ID", "ok");
     } catch (err) {
       toast(`复制失败: ${err.message || err}`, "error");
@@ -3854,6 +4532,10 @@ function updateIssueButtons() {
     famBtn.disabled = famN === 0;
     famBtn.textContent = famN ? `下发 (${famN})` : "下发";
     famBtn.classList.toggle("on", famN > 0);
+  }
+  const famHint = document.querySelector("#flowHost .fb-foot-hint");
+  if (famHint) {
+    famHint.textContent = famN ? `${famN} 项待下发` : "无草稿";
   }
 
   document.querySelectorAll("#flowHost .u3[data-device-uid]").forEach((card) => {
@@ -4289,6 +4971,7 @@ function bindFlowHost(home) {
     card.querySelector('[data-act="edit"]')?.addEventListener("click", () => openDeviceDialog(device));
     card.querySelector('[data-act="refresh"]')?.addEventListener("click", () => readDevice(home, device));
     card.querySelector('[data-act="more-points"]')?.addEventListener("click", () => openDevicePointsDialog(home, device));
+    card.querySelector('[data-act="reg-query"]')?.addEventListener("click", () => openRegQueryDialog(home, device));
     card.querySelector('[data-act="owner-strat"]')?.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -4296,10 +4979,10 @@ function bindFlowHost(home) {
     });
     card.querySelector('[data-act="copy-id"]')?.addEventListener("click", async () => {
       try {
-        await navigator.clipboard.writeText(device.deviceId);
+        await copyText(device.deviceId);
         toast("已复制设备 ID", "ok");
-      } catch (_) {
-        toast(device.deviceId, "ok");
+      } catch (err) {
+        toast(`复制失败: ${err.message || err}`, "error");
       }
     });
     card.querySelector('[data-act="remove"]')?.addEventListener("click", () => {
@@ -4339,14 +5022,44 @@ function bindFlowHost(home) {
       const card = host.querySelector(`.u3[data-device-uid="${CSS.escape(uid)}"]`);
       card?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
       if (device?.deviceId) {
+        // 无电表时：选中一体机 → 电网节点用其 DP26
+        const meters = home.meters || [];
+        const hasMeterVal = meters.some(
+          (m) =>
+            m.lastValue != null &&
+            m.lastValue !== "" &&
+            Number.isFinite(Number(m.lastValue))
+        );
+        if (!meters.length || !hasMeterVal) {
+          if (home.lanMeterDeviceId !== device.deviceId) {
+            home.lanMeterDeviceId = device.deviceId;
+            persist();
+            render();
+            toast(`电网功率来源：${device.name || device.deviceId}（DP26）`, "ok");
+            return;
+          }
+        }
         try {
-          await navigator.clipboard.writeText(device.deviceId);
+          await copyText(device.deviceId);
           toast("已复制设备 ID", "ok");
-        } catch (_) {
-          toast(device.deviceId, "ok");
+        } catch (err) {
+          toast(`复制失败: ${err.message || err}`, "error");
         }
       }
     });
+  });
+
+  host.querySelector('[data-act="lan-meter-device"]')?.addEventListener("change", (e) => {
+    home.lanMeterDeviceId = String(e.target.value || "").trim();
+    persist();
+    render();
+    const d = resolveLanMeterDevice(home);
+    toast(
+      d
+        ? `电网功率来源：${d.name || d.deviceId}（DP26）`
+        : "已清空电网功率来源一体机",
+      "ok"
+    );
   });
 
   if (!home.familyDrafts) home.familyDrafts = {};
@@ -4404,6 +5117,20 @@ function bindFlowHost(home) {
       return;
     }
     openManualScheduleDialog(home, device, { fromFamily: true, kind: "time_of_use" });
+  });
+  host.querySelectorAll('[data-act="fb-fold"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const block = btn.closest(".fb-fold");
+      if (!block) return;
+      const key = block.getAttribute("data-fold");
+      const collapsed = block.classList.toggle("is-collapsed");
+      btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      if (key) {
+        const st = loadFamilyRailFold();
+        st[key] = collapsed;
+        saveFamilyRailFold(st);
+      }
+    });
   });
   host.querySelector('[data-act="family-issue"]')?.addEventListener("click", async () => {
     const r = await issueFamilyToDevices(home);
@@ -5253,15 +5980,181 @@ let editingHomeUid = null;
 let editingDeviceUid = null;
 let editingMeterUid = null;
 
+function isLocalHostPage() {
+  return /^(localhost|127\.0\.0\.1)$/i.test(location.hostname);
+}
+
+const REMOTE_PUSH_URL_KEY = "groupAppControl.remotePushUrl";
+const DEFAULT_REMOTE_PUSH_URL = "http://172.16.239.236:5178";
+
+function getRemotePushUrl() {
+  const input = document.getElementById("remotePushUrl");
+  const fromInput = (input?.value || "").trim();
+  if (fromInput) return fromInput.replace(/\/$/, "");
+  try {
+    const saved = (localStorage.getItem(REMOTE_PUSH_URL_KEY) || "").trim();
+    if (saved) return saved.replace(/\/$/, "");
+  } catch (_) {
+    /* ignore */
+  }
+  return DEFAULT_REMOTE_PUSH_URL;
+}
+
 function openLoginDialog() {
   const home = activeHome();
   const host = home?.envHost || Object.keys(ENV_CONFIG)[1];
   fillEnvSelect(document.getElementById("loginEnv"), host, true);
   document.getElementById("loginCookie").value = state.cookies[host] || "";
+  const onLocal = isLocalHostPage();
+  const pushRow = document.getElementById("remotePushRow");
+  const autoBtn = document.getElementById("btnAutoCookie");
+  if (pushRow) pushRow.classList.toggle("hidden", !onLocal);
+  if (autoBtn) autoBtn.classList.toggle("hidden", !onLocal);
+  const urlInput = document.getElementById("remotePushUrl");
+  if (urlInput && onLocal) {
+    try {
+      urlInput.value =
+        localStorage.getItem(REMOTE_PUSH_URL_KEY) || DEFAULT_REMOTE_PUSH_URL;
+    } catch (_) {
+      urlInput.value = DEFAULT_REMOTE_PUSH_URL;
+    }
+  }
   document.getElementById("loginHint").textContent = state.cookies[host]
-    ? "已保存 Cookie，可覆盖更新。电表请额外保存对应 Hestia 区域 Cookie（可与运营后台 SSO 相同）。"
-    : "从对应环境运营后台 / Hestia DevTools → Application → Cookies 复制整段。";
+    ? onLocal
+      ? "已保存 Cookie。可「自动获取」刷新，或「推送到虚拟机」同步给别人用的服务。"
+      : "已保存 Cookie。虚拟机端请用本机推送更新，或在此手动粘贴覆盖。"
+    : onLocal
+      ? "推荐：本机「自动获取」→「推送到虚拟机」。也可手动从 DevTools 粘贴。"
+      : "虚拟机无法读你电脑的 Chrome。请在本机 http://127.0.0.1:5178 自动获取后点「推送到虚拟机」，或在此手动粘贴。";
   document.getElementById("dlgLogin").showModal();
+}
+
+/**
+ * Pull SSO_USER_TOKEN via server-side tuya-sso-token (local Chrome only).
+ * @param {{force?: boolean, quiet?: boolean, skipRender?: boolean, host?: string}} opts
+ */
+async function refreshSsoCookie(opts = {}) {
+  const force = !!opts.force;
+  const quiet = !!opts.quiet;
+  const skipRender = !!opts.skipRender;
+  const host =
+    opts.host ||
+    document.getElementById("loginEnv")?.value ||
+    activeHome()?.envHost ||
+    Object.keys(ENV_CONFIG)[1];
+  const onLocal = isLocalHostPage();
+  if (!onLocal) {
+    const msg =
+      "虚拟机页面不支持自动获取。请在本机打开 http://127.0.0.1:5178，自动获取后点「推送到虚拟机」，或在此手动粘贴 Cookie";
+    if (!quiet) toast(msg, "error");
+    const hint = document.getElementById("loginHint");
+    if (hint) hint.textContent = msg;
+    throw new Error(msg);
+  }
+
+  const payload = {
+    force,
+    host,
+    applyAll: true,
+    url: host ? `https://${host}` : "",
+  };
+
+  const res = await fetch("/api/sso/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const json = await res.json();
+  if (!json.ok) {
+    let msg = json.error || "自动获取失败";
+    if (json.hint) msg = `${msg}（${json.hint}）`;
+    if (!quiet) toast(msg, "error");
+    const hint = document.getElementById("loginHint");
+    if (hint) {
+      hint.textContent = json.detail
+        ? `${msg}（${String(json.detail).slice(0, 180)}）`
+        : msg;
+    }
+    throw new Error(msg);
+  }
+  if (json.cookies && typeof json.cookies === "object") {
+    state.cookies = { ...state.cookies, ...json.cookies };
+  }
+  const ta = document.getElementById("loginCookie");
+  if (ta && host) ta.value = state.cookies[host] || "";
+  const n = (json.appliedHosts || []).length;
+  if (!quiet) {
+    toast(
+      `已自动填入 SSO（${n} 个环境）${json.preview ? " · " + json.preview : ""}`,
+      "ok"
+    );
+  }
+  const hint = document.getElementById("loginHint");
+  if (hint && !skipRender) {
+    hint.textContent = `已自动更新 SSO_USER_TOKEN（来源：${
+      json.source || "sso-token"
+    }）。需要同步虚拟机时再点「推送到虚拟机」。`;
+  }
+  persist();
+  if (!skipRender) render();
+  return json;
+}
+
+/**
+ * Push local cookies to a remote groupAppControl (VM).
+ * @param {{url?: string, refreshFirst?: boolean, quiet?: boolean}} opts
+ */
+async function pushCookiesToRemote(opts = {}) {
+  const quiet = !!opts.quiet;
+  if (!isLocalHostPage()) {
+    const msg = "请在本机页面执行推送";
+    if (!quiet) toast(msg, "error");
+    throw new Error(msg);
+  }
+  if (opts.refreshFirst) {
+    await refreshSsoCookie({ force: true, quiet: true, skipRender: true });
+  }
+  const remote = (opts.url || getRemotePushUrl()).replace(/\/$/, "");
+  if (!remote) {
+    const msg = "请填写虚拟机地址，例如 http://172.16.239.236:5178";
+    if (!quiet) toast(msg, "error");
+    throw new Error(msg);
+  }
+  try {
+    localStorage.setItem(REMOTE_PUSH_URL_KEY, remote);
+  } catch (_) {
+    /* ignore */
+  }
+  const cookies = state.cookies || {};
+  const n = Object.keys(cookies).filter((k) => String(cookies[k] || "").trim()).length;
+  if (!n) {
+    const msg = "本机尚无 Cookie，请先「自动获取」或粘贴保存";
+    if (!quiet) toast(msg, "error");
+    throw new Error(msg);
+  }
+  let res;
+  try {
+    res = await fetch(`${remote}/api/cookies/import`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cookies, merge: true }),
+    });
+  } catch (err) {
+    const msg = `连不上虚拟机 ${remote}（${err?.message || err}）`;
+    if (!quiet) toast(msg, "error");
+    throw new Error(msg);
+  }
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.ok) {
+    const msg = json.error || `推送失败 HTTP ${res.status}`;
+    if (!quiet) toast(msg, "error");
+    throw new Error(msg);
+  }
+  const imported = json.imported ?? n;
+  if (!quiet) toast(`已推送 ${imported} 条 Cookie → ${remote}`, "ok");
+  const hint = document.getElementById("loginHint");
+  if (hint) hint.textContent = `已推送到 ${remote}（合并写入虚拟机 store）。`;
+  return json;
 }
 
 function openHomeDialog(home) {
@@ -5301,7 +6194,7 @@ function syncMeterDialogMode() {
   if (meterSel) meterSel.required = isThird;
   if (hint) {
     hint.innerHTML = isThird
-      ? "三方电表：选择一台一体机，实时/历史功率取该机 <code>dp 26 / grid_power</code>（并网口功率）。"
+      ? "三方电表：选择一台一体机，实时/历史功率取该机 <code>dp 26 / grid_power</code>（局域网电表配对功率 / meter_power）。"
       : "PID 固定为 <code>7sndpedu8g2tkzvi</code>，功率曲线走 Hestia bizlog（dpId 29 / active_power）。";
   }
   if (regionHint) {
@@ -6388,6 +7281,62 @@ function bindEvents() {
     document.getElementById("loginCookie").value = state.cookies[host] || "";
   });
 
+  const bindAutoCookie = (btn) => {
+    btn?.addEventListener("click", async () => {
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "获取中…";
+      try {
+        await refreshSsoCookie({ force: true });
+        // Keep dialog open so user can review; banner path may not have dialog
+        if (!document.getElementById("dlgLogin")?.open) {
+          /* no-op */
+        }
+      } catch (_) {
+        /* toast already shown */
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
+    });
+  };
+  bindAutoCookie(document.getElementById("btnAutoCookie"));
+  bindAutoCookie(document.getElementById("btnAutoCookieBanner"));
+
+  document.getElementById("btnPushCookies")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btnPushCookies");
+    const prev = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "推送中…";
+    }
+    try {
+      // Prefer current store; if empty for active host, refresh first
+      const host =
+        document.getElementById("loginEnv")?.value ||
+        activeHome()?.envHost ||
+        "";
+      const needRefresh = !(state.cookies[host] || "").trim();
+      await pushCookiesToRemote({ refreshFirst: needRefresh });
+    } catch (_) {
+      /* toast already shown */
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prev || "推送到虚拟机";
+      }
+    }
+  });
+
+  document.getElementById("remotePushUrl")?.addEventListener("change", (e) => {
+    const v = String(e.target.value || "").trim().replace(/\/$/, "");
+    try {
+      if (v) localStorage.setItem(REMOTE_PUSH_URL_KEY, v);
+    } catch (_) {
+      /* ignore */
+    }
+  });
+
   document.getElementById("btnLoginCancel").addEventListener("click", () => {
     document.getElementById("dlgLogin").close();
   });
@@ -6554,6 +7503,19 @@ function bindEvents() {
     document.getElementById("dlgDevicePoints").close();
   });
   document.getElementById("dlgDevicePoints").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.close();
+  });
+  document.getElementById("btnRegQueryClose")?.addEventListener("click", () => {
+    document.getElementById("dlgRegQuery")?.close();
+  });
+  document.getElementById("btnRegQueryRun")?.addEventListener("click", () => runRegQuery());
+  document.getElementById("regQueryAddr")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      runRegQuery();
+    }
+  });
+  document.getElementById("dlgRegQuery")?.addEventListener("click", (e) => {
     if (e.target === e.currentTarget) e.currentTarget.close();
   });
   document.getElementById("btnOwnerStratClose")?.addEventListener("click", () => {
@@ -6726,6 +7688,7 @@ async function readAllActiveHome(opts = {}) {
   }
 
   home.lastReadAt = Date.now();
+  applyDp98ActualForHome(home);
   render();
 
   const deviceMeterResults = results.slice(0, devices.length + meters.length);
@@ -6761,6 +7724,17 @@ async function init() {
       });
     } else {
       ensureElectionPollTimer();
+    }
+  }
+  // Soft auto-fill when no SSO present (local Chrome / cache / env)
+  const hasSso = Object.values(state.cookies || {}).some((c) =>
+    /SSO_USER_TOKEN=/i.test(String(c || ""))
+  );
+  if (!hasSso) {
+    try {
+      await refreshSsoCookie({ quiet: true });
+    } catch (_) {
+      /* keep manual path */
     }
   }
   // 浏览器刷新 ≡ 一键读取：从接口拉取当前家庭全部数值

@@ -96,9 +96,9 @@ function flowBmsSvg(bx, by, bw, bh, mode, wattsLabel, limLabel, capLabel = "") {
 function buildDeviceFlowGeo(home, device, i, layout) {
   const v = device.values || {};
   const pv = Math.max(0, flowNum(v.pv_power_total));
-  const grid = flowNum(v.grid_port_power ?? v.inverter_output_power ?? v.grid_power);
+  const grid = flowNum(v.grid_port_power ?? v.inverter_output_power);
   const bat = flowNum(v.battery_power);
-  const offgrid = flowNum(v.battery_charging_power_grid);
+  const offgrid = flowNum(v.offgrid1_export_power ?? v.battery_charging_power_grid);
   const soc = flowNum(v.current_soc ?? v.main_soc);
   const backup = flowNum(v.backup_soc);
   const batCapRaw = v.battery_capacity;
@@ -144,6 +144,41 @@ function buildDeviceFlowGeo(home, device, i, layout) {
     outputLimit: flowNum(v.output_power_limit),
     inputLimit: flowNum(v.inverter_input_power_limit),
   };
+}
+
+/**
+ * Estimate device card height so ① realtime rows are fully visible (no clip/scroll).
+ * foreignObject height is fixed in SVG, so we size it from field counts + wrap labels.
+ * @param {object} [device]
+ * @returns {number}
+ */
+function estimateUnitCardHeight(device) {
+  const liveCount =
+    (typeof DP_DISPLAY !== "undefined" ? DP_DISPLAY.length : 5) +
+    (typeof HOME_FAMILY_FIELDS !== "undefined" ? HOME_FAMILY_FIELDS.length : 5) +
+    2; // cluster role + node id
+  const liveRows = Math.ceil(liveCount / 2);
+  let wrapExtra = 0;
+  if (typeof HOME_FAMILY_FIELDS !== "undefined") {
+    for (const f of HOME_FAMILY_FIELDS) {
+      const len = String(f.label || "").length;
+      if (len > 18) wrapExtra += 24;
+      else if (len > 10) wrapExtra += 12;
+    }
+  }
+  const editCount = 1 + (typeof DP_EDITABLE !== "undefined" ? DP_EDITABLE.length : 4);
+  const editRows = Math.ceil(editCount / 2);
+  const workShown = String(
+    (device?.drafts?.work_mode || "").trim() || device?.values?.work_mode || ""
+  );
+  const scheduleExtra =
+    workShown === "manual" || workShown === "time_of_use" ? 30 : 0;
+  const headerH = 44;
+  const l1H = 24 + liveRows * 20 + wrapExtra;
+  const l2H = 24 + editRows * 44 + scheduleExtra;
+  const l3H = 56;
+  const l4H = 66;
+  return Math.max(520, Math.min(800, headerH + l1H + l2H + l3H + l4H));
 }
 
 /** Field exists in device pid-schema (or schema not loaded yet → treat as available). */
@@ -206,7 +241,12 @@ function unitCardHtml(g) {
       ? DP_DISPLAY
       : [
           { code: "pv_power_total", label: "PV", unit: "W", aliases: ["pv_power_total"] },
-          { code: "grid_port_power", label: "Grid", unit: "W", aliases: ["grid_port_power", "inverter_output_power", "grid_power"] },
+          {
+            code: "grid_port_power",
+            label: "Grid",
+            unit: "W",
+            aliases: ["grid_port_power", "inverter_output_power"],
+          },
           { code: "battery_power", label: "电池", unit: "W", aliases: ["battery_power"] },
           { code: "current_soc", label: "SOC", unit: "%", aliases: ["current_soc", "main_soc"] },
           { code: "backup_soc", label: "备用", unit: "%", aliases: ["backup_soc", "backup_reserve"] },
@@ -214,7 +254,7 @@ function unitCardHtml(g) {
             code: "battery_charging_power_grid",
             label: "离网口",
             unit: "W",
-            aliases: ["battery_charging_power_grid", "offgrid1_export_power"],
+            aliases: ["offgrid1_export_power", "battery_charging_power_grid"],
           },
         ];
   const editableFields =
@@ -267,7 +307,10 @@ function unitCardHtml(g) {
       if (f.code === "current_soc" && (val == null || val === "")) val = v.main_soc;
       if (f.code === "backup_soc" && (val == null || val === "")) val = v.backup_reserve;
       if (f.code === "grid_port_power" && (val == null || val === "")) {
-        val = v.inverter_output_power ?? v.grid_power;
+        val = v.inverter_output_power;
+      }
+      if (f.code === "battery_charging_power_grid" && (val == null || val === "")) {
+        val = v.offgrid1_export_power;
       }
       if (!missing) {
         if (f.code === "pv_power_total") val = g.pv;
@@ -308,39 +351,65 @@ function unitCardHtml(g) {
     })
     .join("");
 
-  // device_cluster_role：0 主机 / 1 从机 进集群框；其它单机
+  // device_cluster_node_id：有值进对应集群；无值单机。角色仍用 device_cluster_role 展示。
   const clusterRaw = v.device_cluster_role;
   const clusterTxt =
     typeof clusterRoleLabel === "function" ? clusterRoleLabel(clusterRaw) : null;
+  const nodeId =
+    typeof deviceClusterNodeId === "function" ? deviceClusterNodeId(d) : v.device_cluster_node_id || null;
   const inClusterBox =
-    typeof isClusterBoxMember === "function"
-      ? isClusterBoxMember(clusterRaw)
-      : clusterRaw === 0 || clusterRaw === 1 || clusterRaw === "0" || clusterRaw === "1";
+    typeof isClusterBoxMember === "function" ? isClusterBoxMember(d) : nodeId != null && nodeId !== "";
   const clusterHtml = kv(
     "集群角色",
     clusterTxt == null ? null : `${clusterTxt}${clusterRaw != null && clusterRaw !== "" ? ` (${clusterRaw})` : ""}`,
     ""
   );
+  const nodeIdHtml = kv("集群身份", nodeId == null ? null : nodeId, "");
 
-  // grid 口充放策略：仅头部徽章可点查看判定公式（① 区不再重复展示）
+  // grid 口充放策略：理论状态放在 ④ 工况；实际状态来自主机 DP98
   const owner =
     typeof classifyOwnerWorkModel === "function" ? classifyOwnerWorkModel(d) : null;
+  const actual = d.ownerActual || null;
 
   // ②：可下发区列出全部；PID 无此 dpcode → 删除线灰色、不可编辑
   const editHtml = editableFields
     .map((f) => draftInput(f, f.label, f.unit || "W", f.useModelMax ? maxExport : null))
     .join("");
 
+  const roleNum = Number(clusterRaw);
+  const roleKind =
+    !inClusterBox || nodeId == null || nodeId === ""
+      ? "solo"
+      : roleNum === 0
+        ? "master"
+        : roleNum === 1
+          ? "slave"
+          : roleNum === 2
+            ? "electing"
+            : "solo";
   const roleBadge = inClusterBox
-    ? `<span class="u3-role cluster" title="device_cluster_role=${flowEsc(clusterRaw)}">${flowEsc(clusterTxt || "集群")}</span>`
+    ? `<span class="u3-role role-${roleKind}" title="node=${flowEsc(nodeId)} · role=${flowEsc(clusterRaw)}">${flowEsc(clusterTxt || "集群")}</span>`
     : clusterTxt
-      ? `<span class="u3-role solo" title="device_cluster_role=${flowEsc(clusterRaw)}">${flowEsc(clusterTxt)}</span>`
-      : "";
+      ? `<span class="u3-role role-${roleKind}" title="device_cluster_role=${flowEsc(clusterRaw)}">${flowEsc(clusterTxt)}</span>`
+      : `<span class="u3-role role-solo" title="无 device_cluster_node_id">单机</span>`;
 
-  const ownerBadge = owner
-    ? `<button type="button" class="u3-role owner m${owner.model}" data-act="owner-strat"
-        title="点击查看判定公式">${flowEsc(owner.label)}</button>`
-    : "";
+  const theorBadge = owner
+    ? `<button type="button" class="owner-chip m${owner.model}" data-act="owner-strat"
+        title="点击查看判定公式">${flowEsc(owner.label)}</button>
+       <span class="owner-caps">充${owner.chgCapW}/放${owner.dchgCapW}W</span>`
+    : `<span class="hint">—</span>`;
+
+  const actualTip = actual
+    ? `DP98 编号 ${actual.numer === 10 ? "0x0A" : actual.numer}` +
+      (actual.fromMaster ? " · 自主机报文" : " · 本机报文") +
+      ` · 充${actual.chgCapW}W / 放${actual.dchgCapW}W`
+    : "尚未解析到 DP98 / command_receive";
+  const actualBadge = actual
+    ? `<span class="owner-chip m${actual.model}" title="${flowEsc(actualTip)}">${flowEsc(actual.label)}</span>
+       <span class="owner-caps" title="${flowEsc(actualTip)}">#${
+         actual.numer === 10 ? "A" : actual.numer
+       } · 充${actual.chgCapW}/放${actual.dchgCapW}W</span>`
+    : `<span class="hint">—</span>`;
 
   return `<div xmlns="http://www.w3.org/1999/xhtml" class="u3 ${loading}" data-uid="${flowEsc(d.uid)}" data-device-uid="${flowEsc(d.uid)}">
     <div class="u3-name">
@@ -351,7 +420,6 @@ function unitCardHtml(g) {
       <span class="u3-actions">
         <button type="button" class="u3-btn" data-act="refresh" title="读取">↻</button>
         ${roleBadge}
-        ${ownerBadge}
         <span style="font-size:10px;color:#94a3b8">${flowEsc(g.model.badge || "")}</span>
       </span>
     </div>
@@ -361,6 +429,7 @@ function unitCardHtml(g) {
         ${liveHtml}
         ${famLiveHtml}
         ${clusterHtml}
+        ${nodeIdHtml}
       </div>
     </div>
     <div class="layer l2">
@@ -386,12 +455,26 @@ function unitCardHtml(g) {
             <circle cx="12" cy="12" r="3"></circle>
           </svg>
         </button>
+        <button type="button" class="u3-link" data-act="reg-query" title="按寄存器地址反查物模型并读值">寄存器查询</button>
         <span class="u3-foot-spacer"></span>
         <button type="button" class="u3-link" data-act="edit">编辑</button>
         <button type="button" class="u3-link danger" data-act="remove">移除</button>
         <button type="button" class="u3-issue ${draftsN ? "on" : ""}" data-act="issue" ${draftsN ? "" : "disabled"}>
           ${draftsN ? `下发 (${draftsN})` : "下发"}
         </button>
+      </div>
+    </div>
+    <div class="layer l4">
+      <div class="lh"><span>④ 工况</span><span>理论 / 实际</span></div>
+      <div class="owner-status-rows">
+        <div class="owner-status-row">
+          <span class="owner-status-lab">理论状态</span>
+          <span class="owner-status-val">${theorBadge}</span>
+        </div>
+        <div class="owner-status-row">
+          <span class="owner-status-lab">实际状态</span>
+          <span class="owner-status-val">${actualBadge}</span>
+        </div>
       </div>
     </div>
   </div>`;
@@ -401,17 +484,56 @@ function renderFamilyRail(home) {
   const meters = home.meters || [];
   const devices = home.devices || [];
   const meter = meters[0];
+  const gridPow =
+    typeof resolveGridNodePower === "function"
+      ? resolveGridNodePower(home)
+      : {
+          watts:
+            meter?.lastValue == null || Number.isNaN(Number(meter.lastValue))
+              ? null
+              : Number(meter.lastValue),
+          source: "meter",
+          label: meter?.name || meter?.deviceId || "未添加电表",
+        };
   const meterW =
-    meter?.lastValue == null || Number.isNaN(Number(meter.lastValue))
+    gridPow.watts == null || Number.isNaN(Number(gridPow.watts))
       ? "—"
-      : `${meter.lastValue}W`;
-  const meterName = meter?.name || meter?.deviceId || "未添加电表";
+      : `${gridPow.watts}W`;
+  const meterName =
+    gridPow.source === "lan"
+      ? gridPow.label
+      : meter?.name || meter?.deviceId || "未添加电表";
   const meterAgo =
-    typeof meterReadAgoLabel === "function"
+    typeof meterReadAgoLabel === "function" && meter
       ? meterReadAgoLabel(meter)
       : meter?.lastReadAt
         ? "已读"
-        : "未读";
+        : gridPow.source === "lan"
+          ? "来自选中一体机 DP26"
+          : "未读";
+  const lanSelId = String(
+    home.lanMeterDeviceId ||
+      (typeof resolveLanMeterDevice === "function"
+        ? resolveLanMeterDevice(home)?.deviceId
+        : "") ||
+      ""
+  ).trim();
+  const lanSelect =
+    !meters.length && devices.length
+      ? `<label class="fb-lan-src">电网功率来源一体机
+          <select data-act="lan-meter-device">
+            ${devices
+              .map(
+                (d) =>
+                  `<option value="${flowEsc(d.deviceId)}" ${
+                    lanSelId === String(d.deviceId) ? "selected" : ""
+                  }>${flowEsc(d.name || d.deviceId)}</option>`
+              )
+              .join("")}
+          </select>
+          <span class="fb-hint">无电表时取 DP26 局域网电表配对功率</span>
+        </label>`
+      : "";
 
   const meterCards = meters.length
     ? meters
@@ -436,11 +558,17 @@ function renderFamilyRail(home) {
     </div>`
         )
         .join("")
-    : `<div class="rail-empty">尚未添加电表</div>`;
+    : `<div class="rail-empty">尚未添加电表${
+        devices.length ? " · 电网功率可用一体机 DP26" : ""
+      }</div>`;
 
   const devList = devices
     .map(
-      (d) => `<button type="button" class="rail-dev" data-device-uid="${flowEsc(d.uid)}" title="点击复制设备 ID">
+      (d) => `<button type="button" class="rail-dev${
+        !meters.length && lanSelId === String(d.deviceId) ? " active" : ""
+      }" data-device-uid="${flowEsc(d.uid)}" title="${
+        !meters.length ? "选为电网功率来源（DP26）" : "点击复制设备 ID"
+      }">
       <span class="rd-name">${flowEsc(d.name || d.deviceId)}</span>
       <span class="rd-meta">${flowEsc(d.deviceId)}</span>
     </button>`
@@ -495,34 +623,58 @@ function renderFamilyRail(home) {
         }).join("")
       : "";
 
+  const fold = (typeof loadFamilyRailFold === "function" ? loadFamilyRailFold() : {}) || {};
+  // 设备多时默认折叠列表，避免挤掉参数区；用户折叠偏好优先生效
+  const metersFolded = fold.meters === true;
+  const paramsFolded = fold.params === true;
+  const devicesFolded =
+    fold.devices === true || (fold.devices == null && devices.length >= 5);
+
   return `
     <div class="family-bar">
       <div class="fb-hd">
         <strong>家庭侧</strong>
         <span class="fb-sub">电表 · 可下发参数 · 设备列表</span>
       </div>
-      <div class="fb-block">
-        <div class="fb-label">入户电表功率</div>
-        <div class="fb-meter-val">${flowEsc(meterW)}</div>
-        <div class="fb-hint">${flowEsc(meterName)}</div>
-        <div class="fb-hint meter-read-ago" data-meter-ago>${flowEsc(meterAgo)}</div>
-      </div>
-      <div class="fb-block">
-        <div class="fb-label">电表设备</div>
-        ${meterCards}
-      </div>
-      <div class="fb-block fam-params">
-        <div class="fb-label-row">
-          <div class="fb-label">家庭参数（下发到全部一体机）</div>
-          <button type="button" class="u3-issue ${famDraftN ? "on" : ""}" data-act="family-issue"
-            ${famDraftN ? "" : "disabled"}>${famDraftN ? `下发 (${famDraftN})` : "下发"}</button>
+      <div class="fb-scroll">
+        <div class="fb-block">
+          <div class="fb-label">入户电表功率</div>
+          <div class="fb-meter-val">${flowEsc(meterW)}</div>
+          <div class="fb-hint">${flowEsc(meterName)}</div>
+          <div class="fb-hint meter-read-ago" data-meter-ago>${flowEsc(meterAgo)}</div>
+          ${lanSelect}
         </div>
-        <div class="fam-fields">${famFields}</div>
-        <div class="fb-hint">改动后将对家庭内 ${devices.length} 台设备逐台下发</div>
+        <div class="fb-block fb-fold${metersFolded ? " is-collapsed" : ""}" data-fold="meters">
+          <button type="button" class="fb-fold-hd" data-act="fb-fold" aria-expanded="${metersFolded ? "false" : "true"}">
+            <span class="fb-label">电表设备</span>
+            <span class="fb-chevron" aria-hidden="true"></span>
+          </button>
+          <div class="fb-fold-body">${meterCards}</div>
+        </div>
+        <div class="fb-block fam-params fb-fold${paramsFolded ? " is-collapsed" : ""}" data-fold="params">
+          <button type="button" class="fb-fold-hd" data-act="fb-fold" aria-expanded="${paramsFolded ? "false" : "true"}">
+            <span class="fb-label">家庭参数（下发到全部一体机）</span>
+            <span class="fb-chevron" aria-hidden="true"></span>
+          </button>
+          <div class="fb-fold-body">
+            <div class="fam-fields">${famFields}</div>
+            <div class="fb-hint">改动后将对家庭内 ${devices.length} 台设备逐台下发</div>
+          </div>
+        </div>
+        <div class="fb-block fb-fold${devicesFolded ? " is-collapsed" : ""}" data-fold="devices">
+          <button type="button" class="fb-fold-hd" data-act="fb-fold" aria-expanded="${devicesFolded ? "false" : "true"}">
+            <span class="fb-label">一体机 (${devices.length})</span>
+            <span class="fb-chevron" aria-hidden="true"></span>
+          </button>
+          <div class="fb-fold-body">
+            <div class="rail-dev-list">${devList || '<div class="rail-empty">暂无设备</div>'}</div>
+          </div>
+        </div>
       </div>
-      <div class="fb-block">
-        <div class="fb-label">一体机 (${devices.length})</div>
-        <div class="rail-dev-list">${devList || '<div class="rail-empty">暂无设备</div>'}</div>
+      <div class="fb-foot">
+        <span class="fb-foot-hint">${famDraftN ? `${famDraftN} 项待下发` : "无草稿"}</span>
+        <button type="button" class="u3-issue ${famDraftN ? "on" : ""}" data-act="family-issue"
+          ${famDraftN ? "" : "disabled"}>${famDraftN ? `下发 (${famDraftN})` : "下发"}</button>
       </div>
     </div>`;
 }
@@ -535,13 +687,24 @@ function renderHomeEnergyFlow(home) {
   const devices = home.devices || [];
   const meters = home.meters || [];
   const meter = meters[0];
-  const meterW = flowNum(meter?.lastValue);
+  const gridPow =
+    typeof resolveGridNodePower === "function"
+      ? resolveGridNodePower(home)
+      : {
+          watts: flowNum(meter?.lastValue),
+          source: "meter",
+        };
+  const meterW = gridPow.watts == null ? 0 : flowNum(gridPow.watts);
+  const hasGridPow =
+    gridPow.watts != null && Number.isFinite(Number(gridPow.watts));
   const meterAgoTxt =
-    typeof meterReadAgoLabel === "function"
+    typeof meterReadAgoLabel === "function" && meter
       ? meterReadAgoLabel(meter)
       : meter?.lastReadAt
         ? "已读"
-        : "未读";
+        : gridPow.source === "lan"
+          ? "DP26"
+          : "未读";
 
   if (!devices.length) {
     return `<div class="home-flow-shell">
@@ -550,30 +713,57 @@ function renderHomeEnergyFlow(home) {
     </div>`;
   }
 
-  const clusterDevices = devices.filter((d) =>
-    typeof isClusterBoxMember === "function" ? isClusterBoxMember(d) : false
-  );
-  const soloDevices = devices.filter(
-    (d) => !(typeof isClusterBoxMember === "function" ? isClusterBoxMember(d) : false)
-  );
-  const nc = clusterDevices.length;
+  const grouped =
+    typeof groupDevicesByCluster === "function"
+      ? groupDevicesByCluster(devices)
+      : {
+          clusters: (() => {
+            const members = devices.filter((d) =>
+              typeof isClusterBoxMember === "function" ? isClusterBoxMember(d) : false
+            );
+            return members.length ? [{ nodeId: "?", devices: members }] : [];
+          })(),
+          solos: devices.filter(
+            (d) => !(typeof isClusterBoxMember === "function" ? isClusterBoxMember(d) : false)
+          ),
+        };
+  const clusterGroups = grouped.clusters || [];
+  const soloDevices = grouped.solos || [];
+  const ncTotal = clusterGroups.reduce((n, g) => n + (g.devices?.length || 0), 0);
   const ns = soloDevices.length;
   const nn = devices.length;
   const unitW = 248;
   const unitGap = 18;
-  const unitH = 460;
+  const unitH = Math.max(
+    520,
+    ...devices.map((d) => estimateUnitCardHeight(d))
+  );
   const pad = 14;
   const soloGap = 28;
   const leftLane = 28 + nn * 16;
   const rightLane = 36 + nn * 16;
-  const clusterW =
-    nc > 0 ? pad * 2 + nc * unitW + Math.max(0, nc - 1) * unitGap : 0;
-  const soloBlockW =
-    ns > 0 ? ns * unitW + Math.max(0, ns - 1) * unitGap : 0;
-  const clusterX = 24 + leftLane;
-  const soloStartX = nc > 0 ? clusterX + clusterW + soloGap : clusterX;
+
+  const clusterBoxes = [];
+  let xCursor = 24 + leftLane;
+  for (const cg of clusterGroups) {
+    const n = cg.devices.length;
+    if (!n) continue;
+    const w = pad * 2 + n * unitW + Math.max(0, n - 1) * unitGap;
+    clusterBoxes.push({ nodeId: cg.nodeId, devices: cg.devices, x: xCursor, w, n });
+    xCursor += w + soloGap;
+  }
+  const soloStartX = clusterBoxes.length ? xCursor : 24 + leftLane;
+  const soloBlockW = ns > 0 ? ns * unitW + Math.max(0, ns - 1) * unitGap : 0;
+  const clusterSpanW = clusterBoxes.length
+    ? clusterBoxes[clusterBoxes.length - 1].x +
+      clusterBoxes[clusterBoxes.length - 1].w -
+      clusterBoxes[0].x
+    : 0;
+  const firstClusterX = clusterBoxes.length ? clusterBoxes[0].x : soloStartX;
   const unitsSpanW =
-    (nc > 0 ? clusterW : 0) + (nc > 0 && ns > 0 ? soloGap : 0) + soloBlockW;
+    (clusterBoxes.length ? clusterSpanW : 0) +
+    (clusterBoxes.length && ns > 0 ? soloGap : 0) +
+    soloBlockW;
   const gridTop = 10;
   const gridH =
     typeof busDefaultSize === "function" ? busDefaultSize("grid").h : 72;
@@ -589,19 +779,41 @@ function renderHomeEnergyFlow(home) {
   const avgBarH = 30;
   const avgBarY = bmsY + bmsH + 14;
   const loadY = avgBarY + avgBarH + 28;
-  const vbW0 = Math.max(960, clusterX + unitsSpanW + rightLane + 280);
+  const vbW0 = Math.max(960, firstClusterX + unitsSpanW + rightLane + 280);
   let vbW = vbW0;
   let vbH = loadY + 100;
-  const gridCx = clusterX + (nc > 0 ? clusterW : unitsSpanW) / 2;
-  const layoutCluster = { clusterX, pad, unitW, unitGap, unitY, unitH };
-  const layoutSolo = { clusterX: soloStartX, pad: 0, unitW, unitGap, unitY, unitH };
+  const gridCx = firstClusterX + (ncTotal > 0 || ns > 0 ? unitsSpanW : 0) / 2;
 
-  const geos = [
-    ...clusterDevices.map((d, i) => buildDeviceFlowGeo(home, d, i, layoutCluster)),
-    ...soloDevices.map((d, i) => buildDeviceFlowGeo(home, d, i, layoutSolo)),
-  ];
+  const geos = [];
+  for (const box of clusterBoxes) {
+    const layoutCluster = {
+      clusterX: box.x,
+      pad,
+      unitW,
+      unitGap,
+      unitY,
+      unitH,
+      nodeId: box.nodeId,
+    };
+    box.devices.forEach((d, i) => {
+      geos.push(buildDeviceFlowGeo(home, d, i, layoutCluster));
+    });
+  }
+  const layoutSolo = { clusterX: soloStartX, pad: 0, unitW, unitGap, unitY, unitH };
+  soloDevices.forEach((d, i) => {
+    geos.push(buildDeviceFlowGeo(home, d, i, layoutSolo));
+  });
   // edges / fan still need a layout ref for unitW etc.
-  const layout = layoutCluster;
+  const layout = {
+    clusterX: firstClusterX,
+    pad,
+    unitW,
+    unitGap,
+    unitY,
+    unitH,
+  };
+  const clusterX = firstClusterX;
+  const nc = ncTotal;
 
   // ---- wiring buses layout ----
   const wiring =
@@ -671,27 +883,34 @@ function renderHomeEnergyFlow(home) {
   const gridDchgTot = geos.reduce((s, g) => s + g.acDchg, 0);
   const gridChgTot = geos.reduce((s, g) => s + g.acChg, 0);
   // 家庭负载功率（能量守恒 / algo_core）：
-  //   有电表：P = meter − Σ(−grid口) = meter + Σ(grid)
-  //   无电表：P = 基础负载 + 插座
+  //   有电表或 DP26：P = meter − Σ(−grid口) = meter + Σ(grid)
+  //   都没有：P = 基础负载 + 插座
   // 注：逆流上限（feedin）是限值，不参与负载估算
   const sumNegGrid = geos.reduce((s, g) => s + -g.grid, 0);
   const hasMeter =
     meter?.lastValue != null && meter.lastValue !== "" && Number.isFinite(Number(meter.lastValue));
-  const famPower = hasMeter
+  const famPower = hasMeter || (gridPow.source === "lan" && hasGridPow)
     ? Math.round(meterW - sumNegGrid)
     : Math.round(
         flowNum(home.familyValues?.base_load) + flowNum(home.familyValues?.total_plug_power)
       );
   const famFromGrid = Math.max(0, famPower);
   const famOn = famFromGrid > 0;
-  const gridTake = meterW > 0;
-  const gridFeed = meterW < 0;
-  const gridNetTxt = gridFeed
-    ? `馈网 ${-meterW}W`
-    : gridTake
-      ? `取电 ${meterW}W`
-      : `净交换 0W`;
-  const gridSubTxt = `机放 ${gridDchgTot} · 机充 ${gridChgTot}`;
+  const gridTake = hasGridPow && meterW > 0;
+  const gridFeed = hasGridPow && meterW < 0;
+  const gridNetTxt = !hasGridPow
+    ? gridPow.source === "lan"
+      ? `DP26 —`
+      : `净交换 —`
+    : gridFeed
+      ? `馈网 ${-meterW}W`
+      : gridTake
+        ? `取电 ${meterW}W`
+        : `净交换 0W`;
+  const gridSubTxt =
+    gridPow.source === "lan"
+      ? `DP26 · 机放 ${gridDchgTot} · 机充 ${gridChgTot}`
+      : `机放 ${gridDchgTot} · 机充 ${gridChgTot}`;
 
   let gridFill = "#f8fafc";
   let gridStroke = "#94a3b8";
@@ -999,7 +1218,9 @@ function renderHomeEnergyFlow(home) {
       <title>Σ(SOC × 容量) / Σ(容量)${capSum > 0 ? ` · 总容量 ${capSum.toFixed(3)}kWh` : ""}</title>
     </g>`;
 
-  const caption = `PV ${pvTotal}W · 电表 ${meterW}W · 家庭负载 ${famPower}W · 集群放电 ${gridDchgTot}W · 集群充电 ${gridChgTot}W · Bypass ${loadSum}W · 家庭平均SOC ${avgSocTxt}`;
+  const caption = `PV ${pvTotal}W · ${
+    gridPow.source === "lan" ? "DP26" : "电表"
+  } ${hasGridPow ? `${meterW}W` : "—"} · 家庭负载 ${famPower}W · 集群放电 ${gridDchgTot}W · 集群充电 ${gridChgTot}W · Bypass ${loadSum}W · 家庭平均SOC ${avgSocTxt}`;
   const wiredN = geos.reduce((n, g) => {
     const p = portOf(g);
     return n + (p.pv ? 1 : 0) + (p.grid ? 1 : 0) + (p.offgrid ? 1 : 0);
@@ -1061,10 +1282,13 @@ function renderHomeEnergyFlow(home) {
         </defs>
         ${busNodesSvg}
         ${
-          nc > 0
-            ? `<rect x="${clusterX}" y="${clusterY}" width="${clusterW}" height="${clusterH}" rx="12" fill="#fff" stroke="#334155"/>
-        <text x="${clusterX + 12}" y="${clusterY + 22}" font-size="12" font-weight="700">一体机集群 · ①实时 → ②下发 → ③操作 · ${nc} 台</text>`
-            : ""
+          clusterBoxes
+            .map(
+              (box) =>
+                `<rect x="${box.x}" y="${clusterY}" width="${box.w}" height="${clusterH}" rx="12" fill="#fff" stroke="#334155"/>
+        <text x="${box.x + 12}" y="${clusterY + 22}" font-size="12" font-weight="700">一体机集群 · id ${flowEsc(box.nodeId)} · ${box.n} 台</text>`
+            )
+            .join("\n")
         }
         ${
           ns > 0

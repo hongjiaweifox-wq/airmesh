@@ -23,13 +23,13 @@ Lyra 1500
 atlas 3000
 5、展示上报dp：
 -发电功率：pv_power_total
--并网口功率：grid_port_power（dpcode inverter_output_power；兼容旧 grid_power）
+-并网口功率：grid_port_power（dpid 27 / dpcode inverter_output_power；兼容旧 grid_power）
   - 正数 = 馈网（一体机→电网）
   - 负数 = 买电（电网→一体机）
 -电池功率：battery_power
 -当前soc：current_soc
 -备电soc：
--离网口功率：battery_charging_power_grid
+-离网口功率：battery_charging_power_grid（dpid 38 / dpcode offgrid1_export_power）
 -法规并网输出限制：regulation_grid_export_p_limit 上限按照选择的设备型号来
 -逆变输入限制：inverter_input_power_limit
 -逆变输出：output_power_limit
@@ -37,7 +37,9 @@ atlas 3000
 
 
 二、接口
-1、查询设备卡片可展示范围
+1、https://backendng-cn.tuya-inc.com:7799/operation/device/familySearch  这个页面是 获取家庭下设备信息 
+2、https://hestia-cn.tuya-inc.com:7799/  查询设备日志的
+3、
 curl 'https://newenergy-operation-cn.tuya-inc.com:7799/api/wireman-kong/ems/energy-device/pid-schema?devId=6c54c342f15699c328jqyg' \
   -H 'accept: application/json, text/plain, */*' \
   -H 'accept-language: en,zh-CN;q=0.9,zh;q=0.8' \

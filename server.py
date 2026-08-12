@@ -12,6 +12,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import ssl
 import sys
 import threading
@@ -123,6 +124,31 @@ def _save_store(payload: Dict[str, Any]) -> Dict[str, Any]:
     tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(STORE_FILE)
     return store
+
+
+def _import_cookies(incoming: Dict[str, Any], merge: bool = True) -> Dict[str, Any]:
+    """Merge or replace store cookies from a remote push (e.g. Mac → VM)."""
+    if not isinstance(incoming, dict):
+        raise ValueError("cookies must be an object")
+    store = _load_store()
+    cookies = store.get("cookies") if isinstance(store.get("cookies"), dict) else {}
+    if not isinstance(cookies, dict):
+        cookies = {}
+    cleaned: Dict[str, str] = {}
+    for host, raw in incoming.items():
+        h = str(host or "").strip()
+        if not h:
+            continue
+        val = str(raw or "").strip()
+        if not val:
+            continue
+        cleaned[h] = val
+    if merge:
+        cookies = {**cookies, **cleaned}
+    else:
+        cookies = cleaned
+    store["cookies"] = cookies
+    return _save_store(store)
 
 
 def _read_json(handler: SimpleHTTPRequestHandler) -> Dict[str, Any]:
@@ -256,6 +282,146 @@ def _send_csv_file(handler: SimpleHTTPRequestHandler, path: Path, download_name:
     handler.wfile.write(body)
 
 
+SSO_SCRIPT = Path(__file__).resolve().parent / "scripts" / "sso-token.mjs"
+SSO_DEFAULT_URL = "https://newenergy-operation-eu.tuya-inc.com"
+
+
+def _find_node_bin() -> Optional[str]:
+    env_bin = (os.environ.get("NODE_BIN") or "").strip()
+    candidates = [env_bin] if env_bin else []
+    candidates.extend(
+        [
+            "node",
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            str(Path.home() / ".nvm/current/bin/node"),
+        ]
+    )
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            subprocess.run(
+                [cand, "-v"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return cand
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_sso_cookie(raw: str) -> str:
+    """Return a Cookie header fragment that includes SSO_USER_TOKEN=..."""
+    text = (raw or "").strip().strip('"').strip("'")
+    if not text:
+        return ""
+    # Prefer explicit SSO_USER_TOKEN pair from a full cookie string
+    for part in text.split(";"):
+        part = part.strip()
+        if part.upper().startswith("SSO_USER_TOKEN="):
+            return part
+    if "=" not in text:
+        return f"SSO_USER_TOKEN={text}"
+    if text.upper().startswith("SSO_USER_TOKEN="):
+        return text.split(";", 1)[0].strip()
+    return text
+
+
+def _merge_sso_cookie(existing: str, sso_pair: str) -> str:
+    pair = _normalize_sso_cookie(sso_pair)
+    if not pair:
+        return (existing or "").strip()
+    parts = [p.strip() for p in (existing or "").split(";") if p.strip()]
+    out: List[str] = []
+    replaced = False
+    for p in parts:
+        name = p.split("=", 1)[0].strip()
+        if name.upper() == "SSO_USER_TOKEN":
+            if not replaced:
+                out.append(pair)
+                replaced = True
+            continue
+        out.append(p)
+    if not replaced:
+        out.insert(0, pair)
+    return "; ".join(out)
+
+
+def _sso_apply_hosts(store: Dict[str, Any], sso_pair: str, host: str = "") -> List[str]:
+    cookies = store.get("cookies") if isinstance(store.get("cookies"), dict) else {}
+    if not isinstance(cookies, dict):
+        cookies = {}
+    targets = set()
+    if host and host in ALLOWED_HOSTS:
+        targets.add(host)
+    for h in list(cookies.keys()) + list(ALLOWED_HOSTS):
+        if not h or h in ("127.0.0.1", "localhost"):
+            continue
+        if h.endswith(".tuya-inc.com") or h.endswith(".wgine-inc.com") or h.endswith(".tuya-inc.top"):
+            targets.add(h)
+    applied: List[str] = []
+    for h in sorted(targets):
+        cookies[h] = _merge_sso_cookie(str(cookies.get(h) or ""), sso_pair)
+        applied.append(h)
+    store["cookies"] = cookies
+    return applied
+
+
+def _fetch_sso_token(force: bool = False, url: str = "") -> Dict[str, Any]:
+    """Run vendored tuya-sso-token script; return {ok, cookie, preview, source?, error?}."""
+    node = _find_node_bin()
+    if not node:
+        return {
+            "ok": False,
+            "error": "未找到 node，请安装 Node.js ≥ 22.5 或设置 NODE_BIN",
+            "hint": "若页面开在虚拟机 IP：请先在本机启动 groupAppControl（127.0.0.1:5178），再点自动获取；或手动粘贴 Cookie",
+        }
+    if not SSO_SCRIPT.is_file():
+        return {"ok": False, "error": f"缺少 SSO 脚本: {SSO_SCRIPT}"}
+    target = (url or "").strip() or SSO_DEFAULT_URL
+    cmd = [node, str(SSO_SCRIPT), "get", "--quiet", "--url", target]
+    if force:
+        cmd.append("--force")
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env={**os.environ, "TUYA_SSO_BOOTSTRAPPED": os.environ.get("TUYA_SSO_BOOTSTRAPPED", "")},
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "获取 SSO Token 超时（可能卡在钥匙串授权）"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0 or not stdout:
+        hint = stderr.splitlines()[-1] if stderr else f"exit={proc.returncode}"
+        # keep stderr short for UI
+        detail = "\n".join(stderr.splitlines()[-8:]) if stderr else hint
+        return {
+            "ok": False,
+            "error": "无法自动获取 SSO Token（本机浏览器未登录 / 钥匙串未授权 / 虚拟机无 Chrome 登录态）",
+            "detail": detail,
+            "exitCode": proc.returncode,
+        }
+    cookie = _normalize_sso_cookie(stdout.splitlines()[-1].strip())
+    if not cookie.upper().startswith("SSO_USER_TOKEN="):
+        return {"ok": False, "error": "SSO 脚本输出无法识别", "detail": stdout[:120]}
+    preview = cookie[:28] + f"...({len(cookie)} chars)"
+    source = ""
+    for line in stderr.splitlines():
+        if "来源:" in line or "命中" in line or "从缓存" in line or "source=" in line:
+            source = line.strip()
+            break
+    return {"ok": True, "cookie": cookie, "preview": preview, "source": source or "sso-token"}
+
+
 def _proxy_upstream(
     method: str,
     target_host: str,
@@ -386,11 +552,28 @@ class AppHandler(SimpleHTTPRequestHandler):
         if path == "/api/proxy/protocol-query":
             return self._handle_proxy_get("/api/wireman-kong/ems/energy-device/protocol/query")
 
+        if path == "/api/proxy/protocol-model-page":
+            return self._handle_proxy_get("/api/wireman-kong/ems/protocol-model/query/page")
+
         if path == "/api/proxy/query-neko":
             return self._handle_proxy_get("/api/wireman-kong/ems/energy-device/query-neko")
 
         if path == "/api/proxy/high-frequency":
             return self._handle_proxy_get("/api/smartenergy-kong/group/high/frequency")
+
+        if path == "/api/sso/status":
+            node = _find_node_bin()
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "node": bool(node),
+                    "nodeBin": node or "",
+                    "script": SSO_SCRIPT.is_file(),
+                    "scriptPath": str(SSO_SCRIPT),
+                },
+            )
 
         if path == "/api/election/settings":
             qs = parse_qs(parsed.query)
@@ -459,6 +642,34 @@ class AppHandler(SimpleHTTPRequestHandler):
                 {"ok": True, "store": saved, "path": str(STORE_FILE)},
             )
 
+        if path == "/api/cookies/import":
+            body = _read_json(self)
+            incoming = body.get("cookies") if isinstance(body.get("cookies"), dict) else None
+            if not incoming:
+                return _json_response(self, 400, {"ok": False, "error": "missing cookies object"})
+            merge = body.get("merge", True)
+            try:
+                saved = _import_cookies(incoming, merge=bool(merge))
+            except Exception as exc:
+                return _json_response(
+                    self,
+                    500,
+                    {"ok": False, "error": str(exc), "traceback": traceback.format_exc()},
+                )
+            n = len(incoming)
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "imported": n,
+                    "hosts": sorted(str(k) for k in incoming.keys()),
+                    "cookies": saved.get("cookies") if isinstance(saved, dict) else {},
+                    "path": str(STORE_FILE),
+                    "merge": bool(merge),
+                },
+            )
+
         if path == "/api/proxy/issue":
             return self._handle_proxy_post("/api/wireman-kong/ems/energy-device/issue")
 
@@ -472,6 +683,62 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/proxy/bizlog-search":
             return self._handle_proxy_post("/api/bizlog/search")
+
+        if path == "/api/sso/refresh":
+            body = _read_json(self)
+            force = bool(body.get("force"))
+            host = str(body.get("host") or "").strip()
+            apply_all = body.get("applyAll", True)
+            url = str(body.get("url") or "").strip()
+            cookie_in = str(body.get("cookie") or "").strip()
+            if not url and host and host in ALLOWED_HOSTS and host not in ("127.0.0.1", "localhost"):
+                url = f"https://{host}"
+            # Remote UI may import cookie harvested from local Mac (127.0.0.1:5178)
+            if cookie_in:
+                sso_pair = _normalize_sso_cookie(cookie_in)
+                if not sso_pair:
+                    return _json_response(self, 200, {"ok": False, "error": "cookie 无效"})
+                result = {
+                    "ok": True,
+                    "cookie": sso_pair,
+                    "preview": sso_pair[:48] + ("…" if len(sso_pair) > 48 else ""),
+                    "source": "imported",
+                }
+            else:
+                result = _fetch_sso_token(force=force, url=url)
+                if not result.get("ok"):
+                    return _json_response(self, 200, result)
+                sso_pair = str(result.get("cookie") or "")
+            store = _load_store()
+            applied: List[str] = []
+            if apply_all:
+                applied = _sso_apply_hosts(store, sso_pair, host=host)
+            elif host:
+                cookies = store.get("cookies") if isinstance(store.get("cookies"), dict) else {}
+                cookies[host] = _merge_sso_cookie(str(cookies.get(host) or ""), sso_pair)
+                store["cookies"] = cookies
+                applied = [host]
+            try:
+                saved = _save_store(store)
+            except Exception as exc:
+                return _json_response(
+                    self,
+                    500,
+                    {"ok": False, "error": str(exc), "traceback": traceback.format_exc()},
+                )
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "cookie": sso_pair,
+                    "preview": result.get("preview"),
+                    "source": result.get("source"),
+                    "appliedHosts": applied,
+                    "cookies": saved.get("cookies") if isinstance(saved, dict) else store.get("cookies"),
+                    "path": str(STORE_FILE),
+                },
+            )
 
         if path == "/api/election/settings":
             body = _read_json(self)

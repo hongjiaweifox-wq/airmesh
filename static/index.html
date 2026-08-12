@@ -8,7 +8,7 @@
   <link rel="shortcut icon" href="/app-icon-20260806.png" />
   <link rel="apple-touch-icon" href="/app-icon-20260806.png" />
   <link rel="icon" href="/favicon.svg?v=20260806-57" type="image/svg+xml" />
-  <link rel="stylesheet" href="/style.css?v=20260807-26" />
+  <link rel="stylesheet" href="/style.css?v=20260811-07" />
 </head>
 <body>
   <div id="app" class="layout">
@@ -57,7 +57,8 @@
         </header>
 
         <div id="cookieBanner" class="alert alert-warn hidden">
-          当前环境尚未配置 Cookie，请点击左侧「数据区登录态」粘贴登录 Cookie。
+          <span id="cookieBannerText">当前环境尚未配置 Cookie。可点「自动获取」从本机浏览器 SSO 填入，或手动粘贴。</span>
+          <button type="button" class="btn btn-sm" id="btnAutoCookieBanner">自动获取</button>
         </div>
 
         <div class="home-tabs" id="homeTabs" role="tablist">
@@ -132,11 +133,19 @@
         <select id="loginEnv" required></select>
       </label>
       <label>
-        Cookie（从运营后台浏览器复制）
+        Cookie（本机可自动获取；虚拟机请由本机推送或手动粘贴）
         <textarea id="loginCookie" rows="6" placeholder="SSO_USER_TOKEN=...; COOKICE_USER_TOKEN_PC=..."></textarea>
       </label>
       <p class="hint" id="loginHint"></p>
+      <div id="remotePushRow" class="remote-push-row hidden">
+        <label class="remote-push-label">
+          虚拟机地址
+          <input type="url" id="remotePushUrl" placeholder="http://172.16.239.236:5178" />
+        </label>
+        <button type="button" class="btn btn-ghost" id="btnPushCookies" title="把本机已保存的 cookies 推送到虚拟机 store">推送到虚拟机</button>
+      </div>
       <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="btnAutoCookie" title="调用本机 tuya-sso-token，从 Chrome / Cursor 等读取 SSO_USER_TOKEN">自动获取</button>
         <button type="submit" class="btn btn-primary" value="ok">保存</button>
         <button type="button" class="btn btn-ghost" id="btnLoginCancel">取消</button>
       </div>
@@ -279,6 +288,23 @@
     </div>
   </dialog>
 
+  <dialog id="dlgRegQuery" class="modal">
+    <div class="modal-card reg-query-modal">
+      <h3 id="dlgRegQueryTitle">寄存器值查询</h3>
+      <p class="hint" id="dlgRegQueryHint"></p>
+      <div class="reg-meta" id="regQueryMeta">加载协议信息…</div>
+      <label class="fld reg-addr-fld">
+        <span>寄存器地址</span>
+        <input type="text" id="regQueryAddr" placeholder="如 4026 或 0x4026" autocomplete="off" />
+      </label>
+      <div class="modal-actions" style="justify-content:flex-start;margin-top:10px">
+        <button type="button" class="btn btn-primary" id="btnRegQueryRun">查询</button>
+        <button type="button" class="btn btn-ghost" id="btnRegQueryClose">关闭</button>
+      </div>
+      <pre class="reg-query-result" id="regQueryResult" hidden></pre>
+    </div>
+  </dialog>
+
   <dialog id="dlgOwnerStrat" class="modal modal-top">
     <div class="modal-card">
       <h3 id="dlgOwnerStratTitle">上报策略判定</h3>
@@ -334,7 +360,7 @@
 
   <div id="toast" class="toast hidden"></div>
   <script src="/html2canvas.min.js"></script>
-  <script src="/flow.js?v=20260807-16"></script>
-  <script src="/app.js?v=20260807-26"></script>
+  <script src="/flow.js?v=20260811-07"></script>
+  <script src="/app.js?v=20260811-07"></script>
 </body>
 </html>
